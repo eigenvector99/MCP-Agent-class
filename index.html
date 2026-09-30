@@ -650,6 +650,44 @@ def add_project(name: str, description: str = "", due_date: str | None = None) -
 if __name__ == "__main__":
     mcp.run()  # 기본값: stdio 방식
 </script>
+<script type="text/plain" id="src-step3t">
+"""
+STEP 3-1. MCP 서버가 잘 동작하는지 LLM 없이 확인하기
+
+실행: python step3_test_server.py
+
+API 키가 없어도 됩니다. 서버를 띄워서 도구 목록을 받아 오고, 도구 하나를 직접 불러 봅니다.
+여기서 문제가 없어야 STEP 4에서 에이전트에 연결했을 때도 잘 동작합니다.
+"""
+
+import asyncio
+import sys
+from pathlib import Path
+
+from agents.mcp import MCPServerStdio
+
+SERVER_PATH = Path(__file__).parent / "step3_mcp_server.py"
+
+
+async def main() -> None:
+    async with MCPServerStdio(
+        name="personal-db",
+        params={"command": sys.executable, "args": [str(SERVER_PATH)]},
+    ) as server:
+        tools = await server.list_tools()
+        print(f"도구 {len(tools)}개를 찾았습니다.")
+        for tool in tools:
+            first_line = (tool.description or "").splitlines()[0]
+            print(f"  - {tool.name}: {first_line}")
+
+        print("\nget_overview 를 직접 호출해 봅니다.")
+        result = await server.call_tool("get_overview", {})
+        print(result.content[0].text[:600], "...")
+
+
+if __name__ == "__main__":
+    asyncio.run(main())
+</script>
 <script type="text/plain" id="src-step4">
 """
 STEP 4. OpenAI Agents SDK로 에이전트 만들고 MCP 서버 연결하기
@@ -820,6 +858,146 @@ async def main() -> None:
 
 if __name__ == "__main__":
     asyncio.run(main())
+</script>
+<script type="text/plain" id="src-order">
+"""
+다른 주제의 MCP 서버 — 카페 실시간 발주
+
+재고를 지금 시각 기준으로 확인하고, 모자란 품목을 공급처에 발주하고, 물건이 오면 입고 처리합니다.
+personal-db 서버(step3_mcp_server.py)와 뼈대는 같고, 데이터와 도구만 바뀝니다.
+
+처음 실행하면 data/cafe_orders.db에 샘플 데이터를 만듭니다.
+※ stdio 방식 MCP 서버이므로 print()를 쓰지 않습니다.
+"""
+
+import sqlite3
+from datetime import datetime
+from pathlib import Path
+
+from mcp.server.mcpserver import MCPServer
+
+DB_PATH = Path(__file__).parent / "data" / "cafe_orders.db"
+
+# (품목, 단위, 현재 재고, 발주 기준, 공급처)
+SAMPLE_ITEMS = [
+    ("원두(에스프레소 블렌드)", "kg", 3, 5, "빈즈상사"),
+    ("우유", "L", 18, 12, "푸른목장"),
+    ("오트밀크", "L", 4, 6, "푸른목장"),
+    ("테이크아웃 컵(16oz)", "개", 120, 200, "패키지몰"),
+    ("바닐라 시럽", "병", 5, 2, "빈즈상사"),
+]
+
+mcp = MCPServer("realtime-order")
+
+
+def connect() -> sqlite3.Connection:
+    first_run = not DB_PATH.exists()
+    DB_PATH.parent.mkdir(exist_ok=True)
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    if first_run:
+        conn.executescript("""
+            CREATE TABLE items (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT, unit TEXT,
+                                stock INTEGER, reorder_point INTEGER, supplier TEXT);
+            CREATE TABLE orders (id INTEGER PRIMARY KEY AUTOINCREMENT, item_id INTEGER, quantity INTEGER,
+                                 status TEXT, ordered_at TEXT, received_at TEXT);
+        """)
+        conn.executemany(
+            "INSERT INTO items (name, unit, stock, reorder_point, supplier) VALUES (?, ?, ?, ?, ?)",
+            SAMPLE_ITEMS,
+        )
+        conn.commit()
+    return conn
+
+
+def rows(cur: sqlite3.Cursor) -> list[dict]:
+    return [dict(r) for r in cur.fetchall()]
+
+
+def now() -> str:
+    return datetime.now().isoformat(sep=" ", timespec="minutes")
+
+
+# ──────────────────────────────────────────────
+# 조회 도구
+# ──────────────────────────────────────────────
+
+@mcp.tool()
+def get_stock(low_only: bool = False) -> dict:
+    """품목별 현재 재고를 지금 시각 기준으로 돌려준다.
+    low_only=True면 재고가 발주 기준(reorder_point) 이하인 품목만 돌려준다."""
+    sql = "SELECT id, name, unit, stock, reorder_point, supplier FROM items"
+    if low_only:
+        sql += " WHERE stock <= reorder_point"
+    with connect() as conn:
+        items = rows(conn.execute(sql))
+    return {"checked_at": now(), "items": items}
+
+
+@mcp.tool()
+def list_orders(status: str | None = None) -> list[dict]:
+    """발주 목록을 최근 순으로 돌려준다. status로 거를 수 있다('접수', '입고 완료', '취소')."""
+    sql = """SELECT o.id, i.name AS item, o.quantity, i.unit, o.status, o.ordered_at, o.received_at
+             FROM orders o JOIN items i ON i.id = o.item_id"""
+    params: tuple = ()
+    if status:
+        sql += " WHERE o.status = ?"
+        params = (status,)
+    with connect() as conn:
+        return rows(conn.execute(sql + " ORDER BY o.id DESC", params))
+
+
+# ──────────────────────────────────────────────
+# 변경 도구
+# ──────────────────────────────────────────────
+
+@mcp.tool()
+def create_order(item_id: int, quantity: int) -> dict:
+    """품목을 공급처에 발주한다. quantity는 1 이상의 정수.
+    item_id를 모르면 get_stock으로 먼저 확인한다."""
+    if quantity <= 0:
+        return {"error": "quantity는 1 이상이어야 합니다."}
+    with connect() as conn:
+        item = conn.execute("SELECT name, supplier FROM items WHERE id = ?", (item_id,)).fetchone()
+        if not item:
+            return {"error": f"{item_id}번 품목이 없습니다. get_stock으로 id를 확인하세요."}
+        ordered_at = now()
+        cur = conn.execute(
+            "INSERT INTO orders (item_id, quantity, status, ordered_at) VALUES (?, ?, '접수', ?)",
+            (item_id, quantity, ordered_at),
+        )
+        conn.commit()
+    return {"ok": True, "order_id": cur.lastrowid, "item": item["name"],
+            "supplier": item["supplier"], "ordered_at": ordered_at}
+
+
+@mcp.tool()
+def receive_order(order_id: int) -> dict:
+    """발주한 물건이 도착하면 입고 처리한다. 재고가 주문 수량만큼 늘어난다."""
+    with connect() as conn:
+        order = conn.execute("SELECT item_id, quantity, status FROM orders WHERE id = ?", (order_id,)).fetchone()
+        if not order or order["status"] != "접수":
+            return {"error": f"{order_id}번은 입고할 수 있는 발주가 아닙니다. list_orders로 확인하세요."}
+        received_at = now()
+        conn.execute("UPDATE orders SET status = '입고 완료', received_at = ? WHERE id = ?", (received_at, order_id))
+        conn.execute("UPDATE items SET stock = stock + ? WHERE id = ?", (order["quantity"], order["item_id"]))
+        conn.commit()
+    return {"ok": True, "order_id": order_id, "received_at": received_at}
+
+
+@mcp.tool()
+def cancel_order(order_id: int) -> dict:
+    """아직 입고되지 않은 발주를 취소한다. 공급처에 이미 전달됐을 수 있으니 사용자가 확인한 뒤에만 쓴다."""
+    with connect() as conn:
+        cur = conn.execute("UPDATE orders SET status = '취소' WHERE id = ? AND status = '접수'", (order_id,))
+        conn.commit()
+        if cur.rowcount == 0:
+            return {"error": f"{order_id}번은 취소할 수 있는 발주가 아닙니다. list_orders로 확인하세요."}
+    return {"ok": True, "order_id": order_id, "status": "취소"}
+
+
+if __name__ == "__main__":
+    mcp.run()  # 기본값: stdio 방식
 </script>
 <script>
 /* ================================================================
@@ -1012,6 +1190,22 @@ A(`return {"ok": True, "project_id": cur.lastrowid, "name": name}`, `성공 결�
 A(`# 조회 도구 (읽기만 함)`, `조회 도구 구역`, `여기부터는 DB를 읽기만 하는 도구들입니다.`);
 A(`# 변경 도구 (DB를 바꿈)`, `변경 도구 구역`, `여기부터는 DB를 바꾸는 도구들입니다. 위험한 도구만 골라 승인을 걸기 위해 조회 도구와 나눠 두었습니다.`);
 
+/* ---------- STEP 3 · 서버 점검 (step3_test_server.py) ---------- */
+A(`) as server:`, `연결된 서버에 이름 붙이기`, `연결된 MCP 서버를 server라는 이름으로 씁니다. 에이전트 없이 이 server에게 직접 묻고 시킵니다.`);
+A(`tools = await server.list_tools()`, `도구 목록 받아 오기`,
+  `서버에게 어떤 도구가 있는지 묻습니다. 에이전트도 서버에 연결하면 똑같이 이 목록을 받아 LLM에게 보여 줍니다. LLM과 API 키 없이도 동작합니다.`,
+  [[`await`, `응답을 기다리기`], [`server.list_tools()`, `도구 목록 요청`]], `도구`);
+A(`print(f"도구 {len(tools)}개를 찾았습니다.")`, `도구 개수 출력`, `len()은 목록의 길이입니다. 7개가 나오면 서버의 @mcp.tool()이 모두 등록된 것입니다.`);
+A(`for tool in tools:`, `도구 하나씩`, `받아 온 도구 목록에서 하나씩 꺼내 반복합니다.`);
+A(`first_line = (tool.description or "").splitlines()[0]`, `설명 첫 줄만 꺼내기`,
+  `tool.description에는 함수의 docstring이 그대로 들어 있습니다. 여러 줄 중 첫 줄만 잘라 보여 줍니다.`, [[`tool.description`, `도구 설명 = docstring`], [`.splitlines()[0]`, `줄로 나눠 첫 줄만`]]);
+A(`print(f"  - {tool.name}: {first_line}")`, `도구 이름과 설명 출력`, `함수 이름이 곧 도구 이름, docstring이 곧 도구 설명이라는 것을 눈으로 확인합니다.`);
+A(`print("\\nget_overview 를 직접 호출해 봅니다.")`, `안내 출력`, `\\n은 줄바꿈입니다. 한 줄 띄우고 안내 문구를 보여 줍니다.`);
+A(`result = await server.call_tool("get_overview", {})`, `도구 직접 호출하기`,
+  `LLM 대신 사람이 도구 이름과 입력값을 정해 직접 부릅니다. 에이전트가 도구를 부를 때 하는 일과 같습니다.`,
+  [[`"get_overview"`, `부를 도구 이름`], [`{}`, `넘길 입력값 (없음)`]], `도구`);
+A(`print(result.content[0].text[:600], "...")`, `결과 앞부분 출력`, `result.content[0].text에 도구가 돌려준 결과가 글자로 들어 있습니다. [:600]은 앞 600글자만 자르기입니다.`);
+
 /* ---------- STEP 4 · 에이전트 ---------- */
 A(`import asyncio`, `비동기 실행 모듈`, `async/await로 쓴 코드를 실행합니다. 맨 아래 asyncio.run(main())에서 씁니다.`);
 A(`import os`, `환경변수 읽기용 모듈`, `.env에서 불러온 키와 모델 이름을 os.getenv로 읽습니다.`);
@@ -1110,6 +1304,79 @@ AP(`print(f"  · 도구 호출:`, `로그 출력`, `"· 도구 호출: delete_ta
 A(`print_tool_calls(result)`, `도구 호출 로그 보여 주기`, `최종 답변 전에 이번에 부른 도구들을 보여 줍니다.`);
 A(`# (에이전트 정의와 대화 루프는 STEP 4와 같음)`, `생략 표시`, `이 사이에는 STEP 4에서 쓴 에이전트 정의와 대화 루프가 그대로 들어 있습니다.`);
 
+/* ---------- 3_다른 주제의 MCP · 실시간 발주 ---------- */
+A(`from datetime import datetime`, `현재 시각 도구`, `datetime.now()로 지금 시각을 얻습니다. 발주·입고·조회 시각을 모두 여기서 만듭니다.`);
+A(`DB_PATH = Path(__file__).parent / "data" / "cafe_orders.db"`, `발주 DB 파일 위치`, `personal-db와 같은 방식으로 data 폴더 안의 파일을 가리킵니다. 파일이 없으면 처음 실행할 때 샘플 데이터로 만듭니다.`);
+A(`SAMPLE_ITEMS = [`, `샘플 품목 목록`, `품목, 단위, 현재 재고, 발주 기준, 공급처를 한 줄씩 적은 목록입니다. 원두·오트밀크·컵 세 가지가 발주 기준 이하로 시작합니다.`);
+AP(`("`, `샘플 품목 한 줄`, `(품목, 단위, 현재 재고, 발주 기준, 공급처) 순서입니다. 괄호로 묶은 값 묶음을 튜플이라고 합니다.`);
+A(`mcp = MCPServer("realtime-order")`, `발주용 도구 상자 만들기`, `서버 이름만 realtime-order로 바뀌었고, 만드는 방법은 personal-db와 똑같습니다.`, [[`"realtime-order"`, `서버 이름표`]], `도구`);
+A(`first_run = not DB_PATH.exists()`, `처음 실행인지 확인`, `DB 파일이 아직 없으면 True입니다. 아래에서 표와 샘플 데이터를 만들지 이 값으로 정합니다.`);
+A(`DB_PATH.parent.mkdir(exist_ok=True)`, `data 폴더 만들기`, `폴더가 없으면 만들고, 이미 있으면 그대로 둡니다.`);
+A(`if first_run:`, `처음 실행일 때만`, `표를 만들고 샘플 품목을 넣습니다. 두 번째 실행부터는 건너뜁니다.`);
+A(`conn.executescript("""`, `여러 SQL 문장을 한 번에 실행`, `표 두 개(items 품목, orders 발주)를 만드는 SQL을 한꺼번에 실행합니다.`);
+A(`""")`, `여러 줄 SQL 닫기`, `따옴표 세 개로 SQL을 닫고, 괄호로 executescript 호출을 닫습니다.`);
+A(`conn.executemany(`, `여러 줄을 한 번에 넣기`, `같은 INSERT 문장에 SAMPLE_ITEMS의 줄을 하나씩 채워 모두 넣습니다.`);
+AP(`"INSERT INTO items`, `샘플 품목 넣는 SQL`, `품목 표에 한 줄을 넣는 문장입니다. ? 다섯 자리에 튜플의 값이 차례로 들어갑니다.`);
+A(`SAMPLE_ITEMS,`, `넣을 값 목록`, `위에서 적어 둔 샘플 품목입니다.`);
+A(`def now() -> str:`, `지금 시각 도우미`, `발주·입고·조회 시각을 모두 이 함수로 기록합니다. '실시간'의 기준점입니다. @mcp.tool()이 없으니 도구가 아닙니다.`);
+A(`return datetime.now().isoformat(sep=" ", timespec="minutes")`, `현재 시각을 글자로`, `'2026-09-30 14:05'처럼 분 단위까지 적습니다.`);
+A(`# 조회 도구`, `조회 도구 구역`, `여기부터는 재고와 발주를 읽기만 하는 도구들입니다.`);
+A(`# 변경 도구`, `변경 도구 구역`, `여기부터는 발주를 넣고, 입고하고, 취소하는 도구들입니다. 에이전트 쪽에서 이 중 위험한 도구에만 승인을 겁니다.`);
+A(`# connect(), rows(), now()는 파일 위쪽에 있는 도우미 함수`, `도우미 함수 안내`, `DB 연결, 결과를 dict 목록으로 바꾸기, 지금 시각 구하기를 맡는 함수입니다. order_mcp_server.py 완성본에서 볼 수 있습니다.`);
+A(`def get_stock(low_only: bool = False) -> dict:`, `실시간 재고 조회 도구`,
+  `입력은 참/거짓(bool) 하나이고 기본값은 False입니다. "발주할 거 있어?"라고 물으면 에이전트가 low_only=True로 부릅니다.`,
+  [[`low_only: bool`, `참(True) 또는 거짓(False)`], [`= False`, `기본값: 전체 품목`], [`-> dict`, `결과는 dict 하나`]], `도구`);
+A(`"""품목별 현재 재고를 지금 시각 기준으로 돌려준다.`, `무엇을 돌려주는지`, `'지금 시각 기준'이라고 적어 두면 에이전트가 답할 때 조회 시각을 함께 알려 줍니다.`, null, `도구`);
+A(`low_only=True면 재고가 발주 기준(reorder_point) 이하인 품목만 돌려준다."""`, `입력 값의 뜻 적기`, `True를 넣었을 때 무엇이 달라지는지 적어 두면, 에이전트가 발주 관련 질문에 알맞게 값을 채웁니다.`, null, `도구`);
+A(`sql = "SELECT id, name, unit, stock, reorder_point, supplier FROM items"`, `기본 SQL`, `품목 표의 모든 품목을 고르는 문장에서 시작합니다.`);
+A(`if low_only:`, `True일 때만`, `low_only가 True면 조건을 이어 붙입니다.`);
+A(`sql += " WHERE stock <= reorder_point"`, `발주 기준 이하만`, `현재 재고가 발주 기준보다 작거나 같은 품목만 남깁니다. 두 칸을 서로 비교하는 조건입니다.`);
+A(`items = rows(conn.execute(sql))`, `실행해서 목록으로`, `SQL을 실행하고 결과를 dict 목록으로 바꿔 items에 담습니다.`);
+A(`return {"checked_at": now(), "items": items}`, `조회 시각과 함께 돌려주기`, `checked_at에 지금 시각을 넣어 돌려주면, 에이전트가 '14:05 기준'처럼 언제 기준의 재고인지 말할 수 있습니다.`);
+A(`def list_orders(status: str | None = None) -> list[dict]:`, `발주 목록 도구`, `list_projects와 같은 모양입니다. status를 비워 두면 전체, 넣으면 그 상태의 발주만 돌려줍니다.`, null, `도구`);
+A(`"""발주 목록을 최근 순으로 돌려준다. status로 거를 수 있다('접수', '입고 완료', '취소')."""`, `허용 값까지 적은 설명`, `status에 넣을 값을 정확히 적어 두면 에이전트가 '입고완료'처럼 틀린 값을 넣지 않습니다.`, null, `도구`);
+AP(`sql = """SELECT o.id`, `발주 + 품목 이름 SQL`, `JOIN으로 발주마다 품목 이름과 단위를 붙입니다.`);
+A(`sql += " WHERE o.status = ?"`, `상태 조건 추가`, `status 값과 같은 발주만 남깁니다.`);
+A(`return rows(conn.execute(sql + " ORDER BY o.id DESC", params))`, `최근 순으로 돌려주기`, `DESC는 큰 번호부터, 즉 최근 발주부터 정렬합니다.`);
+A(`def create_order(item_id: int, quantity: int) -> dict:`, `발주 넣기 도구`,
+  `품목 번호와 수량, 두 정수를 꼭 받습니다. 돈이 드는 변경 도구라서 에이전트 쪽에서 사람 승인을 겁니다.`,
+  [[`item_id: int`, `품목 번호(정수)`], [`quantity: int`, `수량(정수)`]], `도구`);
+A(`"""품목을 공급처에 발주한다. quantity는 1 이상의 정수.`, `하는 일과 입력 조건`, `수량 조건을 적어 두면 에이전트가 0이나 음수를 넣지 않습니다.`, null, `도구`);
+A(`item_id를 모르면 get_stock으로 먼저 확인한다."""`, `다른 도구와 이어 주기`, `품목 번호를 모르면 get_stock을 먼저 부르라고 알려 줍니다. 에이전트가 도구를 부르는 순서가 여기서 정해집니다.`, null, `도구`);
+A(`if quantity <= 0:`, `수량 점검`, `<=는 '작거나 같다'입니다. 0 이하의 수량은 받지 않습니다.`);
+A(`item = conn.execute("SELECT name, supplier FROM items WHERE id = ?", (item_id,)).fetchone()`, `품목이 있는지 확인`, `번호에 맞는 품목 한 줄을 가져옵니다. 없으면 None입니다.`);
+A(`if not item:`, `그런 품목이 없으면`, `없는 번호가 들어왔다는 뜻이라 오류 결과를 돌려줍니다.`);
+A(`return {"error": f"{item_id}번 품목이 없습니다. get_stock으로 id를 확인하세요."}`, `다음 행동까지 알려 주기`, `없는 번호면 get_stock으로 확인하라고 알려 줍니다. 에이전트는 목록을 조회한 뒤 다시 시도합니다.`);
+A(`ordered_at = now()`, `발주 시각 기록`, `지금 시각을 발주 시각으로 남깁니다.`);
+A(`"INSERT INTO orders (item_id, quantity, status, ordered_at) VALUES (?, ?, '접수', ?)",`, `발주 한 줄 추가 SQL`, `상태는 '접수'로 시작하고, 품목·수량·시각은 ? 자리에 채웁니다.`);
+A(`(item_id, quantity, ordered_at),`, `? 자리에 들어갈 값`, `? 순서대로 품목 번호, 수량, 발주 시각이 들어갑니다.`);
+A(`return {"ok": True, "order_id": cur.lastrowid, "item": item["name"],`, `발주 결과 돌려주기`, `발주 번호, 품목, 공급처, 시각을 돌려주면 에이전트가 '빈즈상사에 발주했어요'처럼 확인해 줍니다. { } 안이라 다음 줄로 이어 쓸 수 있습니다.`);
+A(`"supplier": item["supplier"], "ordered_at": ordered_at}`, `발주 결과 (이어지는 줄)`, `위 줄에서 연 { }가 여기서 닫힙니다.`);
+A(`def receive_order(order_id: int) -> dict:`, `입고 처리 도구`, `발주 번호 하나를 받아, 발주 상태와 재고를 함께 바꿉니다.`, null, `도구`);
+A(`"""발주한 물건이 도착하면 입고 처리한다. 재고가 주문 수량만큼 늘어난다."""`, `언제 쓰는지와 결과`, `"물건 왔어" 같은 말에 에이전트가 이 도구를 고르게 해 줍니다. 재고가 늘어난다는 결과도 적어 둡니다.`, null, `도구`);
+A(`order = conn.execute("SELECT item_id, quantity, status FROM orders WHERE id = ?", (order_id,)).fetchone()`, `발주 한 건 읽기`, `입고할 품목과 수량, 지금 상태를 먼저 읽어 둡니다.`);
+A(`if not order or order["status"] != "접수":`, `입고할 수 있는 발주인지`, `없는 발주이거나 이미 입고·취소된 발주면 오류를 돌려줍니다. 같은 발주를 두 번 입고하는 실수를 막습니다.`);
+A(`received_at = now()`, `입고 시각 기록`, `지금 시각을 입고 시각으로 남깁니다.`);
+A(`conn.execute("UPDATE orders SET status = '입고 완료', received_at = ? WHERE id = ?", (received_at, order_id))`, `발주 상태 바꾸기`, `발주를 '입고 완료'로 바꾸고 입고 시각을 적습니다.`);
+A(`conn.execute("UPDATE items SET stock = stock + ? WHERE id = ?", (order["quantity"], order["item_id"]))`, `재고 늘리기`, `stock = stock + ?는 '지금 재고에 수량을 더한 값으로' 바꾸라는 뜻입니다. 두 표를 바꾼 뒤 commit 한 번으로 함께 저장합니다.`);
+A(`return {"ok": True, "order_id": order_id, "received_at": received_at}`, `입고 결과 돌려주기`, `입고한 발주 번호와 시각을 돌려줍니다.`);
+A(`def cancel_order(order_id: int) -> dict:`, `발주 취소 도구`, `되돌리기 어려운 변경이라 에이전트 쪽에서 사람 승인을 겁니다.`, null, `도구`);
+AP(`"""아직 입고되지 않은 발주를 취소한다.`, `위험을 알리는 설명`, `공급처에 이미 전달됐을 수 있다는 점과 '사용자가 확인한 뒤에만'이라는 조건을 적어 두면 에이전트가 함부로 부르지 않습니다.`, null, `도구`);
+A(`cur = conn.execute("UPDATE orders SET status = '취소' WHERE id = ? AND status = '접수'", (order_id,))`, `접수 상태일 때만 취소`, `조건에 status = '접수'를 함께 걸어, 이미 입고된 발주는 바뀌지 않게 합니다.`);
+A(`return {"ok": True, "order_id": order_id, "status": "취소"}`, `취소 결과 돌려주기`, `취소한 발주 번호와 바뀐 상태를 돌려줍니다.`);
+A(`ORDER_SERVER = Path(__file__).parent / "order_mcp_server.py"`, `연결할 발주 서버 파일`, `step4의 SERVER_PATH와 같은 역할입니다. 가리키는 파일만 발주 서버로 바뀌었습니다.`);
+AP(`ORDER_INSTRUCTIONS = `, `발주 비서의 지시문`, `역할과 규칙만 발주에 맞게 바꿨습니다. 재고는 도구로 확인하고, 발주 전에는 품목과 수량을 알려 주게 합니다.`, null, `지시문`);
+A(`name="realtime-order",`, `서버 이름표`, `로그와 오류 메시지에 표시되는 서버 이름입니다.`);
+A(`params={"command": sys.executable, "args": [str(ORDER_SERVER)]},`, `발주 서버 파일 실행`, `step4와 같고, 실행할 파일만 ORDER_SERVER로 바뀌었습니다.`);
+A(`require_approval={"create_order": "always", "cancel_order": "always"},`, `돈이 드는 도구는 승인 후`,
+  `발주와 취소는 부르기 전에 항상 멈추고 사람의 y/n을 기다립니다. 조회 도구와 입고 처리는 승인 없이 바로 씁니다.`,
+  [[`"create_order"`, `발주 넣기`], [`"cancel_order"`, `발주 취소`], [`"always"`, `매번 승인`]]);
+A(`) as order_server:`, `연결된 서버에 이름 붙이기`, `연결된 발주 서버를 order_server라는 이름으로 씁니다.`);
+A(`name="카페 발주 매니저",`, `에이전트 이름`, `에이전트를 부르는 이름입니다. 원하는 이름으로 바꿔도 됩니다.`);
+A(`instructions=ORDER_INSTRUCTIONS,`, `지시문 넣기`, `위에서 적어 둔 발주 비서의 지시문을 넣습니다.`, null, `지시문`);
+A(`mcp_servers=[order_server],`, `도구 넣기: 발주 서버 꽂기`, `발주 서버의 도구 5개가 그대로 에이전트의 도구가 됩니다. [db_server, order_server]처럼 두 서버를 함께 꽂을 수도 있습니다.`, null, `도구`);
+A(`# 대화 루프(while, Runner.run, 승인 묻기)는 step5_agent_chat.py와 같음`, `생략 표시`, `이 아래에는 STEP 5에서 쓴 대화 루프와 승인 묻기 코드가 그대로 들어갑니다.`);
+
 /* ---------- 따라 쓰기 레슨 ---------- */
 // k: T = 직접 쓰는 줄, G = 주어진 줄, E = 빈 줄
 const LESSONS = [
@@ -1136,7 +1403,7 @@ const LESSONS = [
       ['T', '    - due_within_days: 오늘부터 N일 안에 마감인 할 일만"""']] },
   { id: 'connect', file: '04_connect_server.py', step: 'STEP 4', title: 'MCP 서버를 에이전트 쪽에 연결하기',
     goal: '에이전트 코드가 서버 파일을 직접 띄워 연결합니다. 서버를 따로 켜 둘 필요가 없습니다.',
-    link: { file: 'step4', line: 50 }, where: 'step4_agent.py 20–21줄과 43–47줄에 같은 코드가 있습니다.',
+    link: { file: 'step3t', line: 20 }, where: 'step3_test_server.py 20–23줄, step4_agent.py 43–47줄에 같은 연결 코드가 있습니다.',
     lines: [['T', 'from agents import Agent, Runner'], ['T', 'from agents.mcp import MCPServerStdio'], ['E', ''],
       ['T', 'async with MCPServerStdio('], ['T', '    name="personal-db",'],
       ['T', '    params={"command": sys.executable, "args": [str(SERVER_PATH)]},'], ['T', ') as db_server:']] },
@@ -1166,6 +1433,54 @@ const LESSONS = [
       ['G', '# (에이전트 정의와 대화 루프는 STEP 4와 같음)'], ['G', 'result = await Runner.run(agent, question, session=session)'],
       ['T', 'while result.interruptions:'], ['T', '    state = result.to_state()'], ['T', '    ask_approval(result, state)'],
       ['T', '    result = await Runner.run(agent, state, session=session)']] },
+  /* 3_다른 주제의 MCP · 실시간 발주 */
+  { id: 'o-stock', group: 'order', file: '01_order_stock.py', step: '실시간 발주', title: '실시간 재고 조회 도구',
+    goal: 'personal-db 서버와 뼈대는 같습니다. 서버 이름과 도구만 바뀌고, 조회 시각을 함께 돌려주면 에이전트가 "지금 기준"으로 답합니다.',
+    link: { file: 'order', line: 75 }, where: 'order_mcp_server.py 28줄과 63–72줄에 같은 코드가 있습니다.',
+    lines: [['G', 'from mcp.server.mcpserver import MCPServer'], ['G', '# connect(), rows(), now()는 파일 위쪽에 있는 도우미 함수'], ['E', ''],
+      ['T', 'mcp = MCPServer("realtime-order")'], ['E', ''],
+      ['T', '@mcp.tool()'], ['T', 'def get_stock(low_only: bool = False) -> dict:'],
+      ['T', '    """품목별 현재 재고를 지금 시각 기준으로 돌려준다.'], ['T', '    low_only=True면 재고가 발주 기준(reorder_point) 이하인 품목만 돌려준다."""'],
+      ['T', '    sql = "SELECT id, name, unit, stock, reorder_point, supplier FROM items"'], ['T', '    if low_only:'],
+      ['T', '        sql += " WHERE stock <= reorder_point"'], ['T', '    with connect() as conn:'], ['T', '        items = rows(conn.execute(sql))'],
+      ['T', '    return {"checked_at": now(), "items": items}']] },
+  { id: 'o-create', group: 'order', file: '02_order_create.py', step: '실시간 발주', title: '발주 넣기 도구',
+    goal: 'DB를 바꾸는 도구입니다. 입력 조건을 점검하고, 실패하면 이유와 다음 행동을 담은 {"error": …}를 돌려줍니다.',
+    link: { file: 'order', line: 126 }, where: 'order_mcp_server.py 92–109줄에 같은 코드가 있습니다.',
+    lines: [['T', '@mcp.tool()'], ['T', 'def create_order(item_id: int, quantity: int) -> dict:'],
+      ['T', '    """품목을 공급처에 발주한다. quantity는 1 이상의 정수.'], ['T', '    item_id를 모르면 get_stock으로 먼저 확인한다."""'],
+      ['T', '    if quantity <= 0:'], ['T', '        return {"error": "quantity는 1 이상이어야 합니다."}'],
+      ['G', '    with connect() as conn:'], ['G', '        item = conn.execute("SELECT name, supplier FROM items WHERE id = ?", (item_id,)).fetchone()'],
+      ['T', '        if not item:'], ['T', '            return {"error": f"{item_id}번 품목이 없습니다. get_stock으로 id를 확인하세요."}'],
+      ['T', '        ordered_at = now()'],
+      ['G', '        cur = conn.execute('], ['G', `            "INSERT INTO orders (item_id, quantity, status, ordered_at) VALUES (?, ?, '접수', ?)",`],
+      ['G', '            (item_id, quantity, ordered_at),'], ['G', '        )'],
+      ['T', '        conn.commit()'], ['T', '    return {"ok": True, "order_id": cur.lastrowid, "item": item["name"],'],
+      ['T', '            "supplier": item["supplier"], "ordered_at": ordered_at}']] },
+  { id: 'o-receive', group: 'order', file: '03_order_receive.py', step: '실시간 발주', title: '입고 처리: 두 표를 함께 바꾸기',
+    goal: '물건이 도착하면 발주 상태와 재고를 함께 바꿉니다. 두 번 바꾸고 commit은 한 번입니다.',
+    link: { file: 'order', line: 126 }, where: 'order_mcp_server.py 112–123줄과 137–138줄에 같은 코드가 있습니다.',
+    lines: [['T', '@mcp.tool()'], ['T', 'def receive_order(order_id: int) -> dict:'],
+      ['T', '    """발주한 물건이 도착하면 입고 처리한다. 재고가 주문 수량만큼 늘어난다."""'],
+      ['G', '    with connect() as conn:'], ['G', '        order = conn.execute("SELECT item_id, quantity, status FROM orders WHERE id = ?", (order_id,)).fetchone()'],
+      ['T', '        if not order or order["status"] != "접수":'],
+      ['T', '            return {"error": f"{order_id}번은 입고할 수 있는 발주가 아닙니다. list_orders로 확인하세요."}'],
+      ['T', '        received_at = now()'],
+      ['T', `        conn.execute("UPDATE orders SET status = '입고 완료', received_at = ? WHERE id = ?", (received_at, order_id))`],
+      ['T', '        conn.execute("UPDATE items SET stock = stock + ? WHERE id = ?", (order["quantity"], order["item_id"]))'],
+      ['T', '        conn.commit()'], ['T', '    return {"ok": True, "order_id": order_id, "received_at": received_at}'], ['E', ''],
+      ['T', 'if __name__ == "__main__":'], ['T', '    mcp.run()']] },
+  { id: 'o-agent', group: 'order', file: '04_order_agent.py', step: '실시간 발주', title: '에이전트에 발주 서버 연결하기',
+    goal: '에이전트 코드는 STEP 4·5와 같고, 연결하는 서버와 지시문만 바뀝니다. 돈이 드는 발주와 취소에만 사람 승인을 겁니다.',
+    link: { file: 'order', line: 75 }, where: 'step5_agent_chat.py의 64–75줄과 같은 모양입니다. 서버 파일과 이름만 바뀌었습니다.',
+    lines: [['G', 'ORDER_SERVER = Path(__file__).parent / "order_mcp_server.py"'],
+      ['G', 'ORDER_INSTRUCTIONS = "너는 카페 재고와 발주를 관리하는 비서다. 재고는 get_stock으로 확인하고, 발주 전에는 품목과 수량을 한 줄로 알려 준다."'], ['E', ''],
+      ['T', 'async with MCPServerStdio('], ['T', '    name="realtime-order",'],
+      ['T', '    params={"command": sys.executable, "args": [str(ORDER_SERVER)]},'],
+      ['T', '    require_approval={"create_order": "always", "cancel_order": "always"},'], ['T', ') as order_server:'],
+      ['T', '    agent = Agent('], ['T', '        name="카페 발주 매니저",'], ['T', '        instructions=ORDER_INSTRUCTIONS,'],
+      ['T', '        mcp_servers=[order_server],'], ['T', '    )'],
+      ['G', '    # 대화 루프(while, Runner.run, 승인 묻기)는 step5_agent_chat.py와 같음']] },
 ];
 
 /* ---------- 빈칸 채우기 ---------- */
@@ -1206,6 +1521,27 @@ const FILES = {
       { line: 177, kind: 'exact', label: 'add_project를 도구로 등록', ph: '✎ 마지막 도구 add_project 등록하기',
         hint: '이 한 줄이 없으면 add_project는 에이전트에게 보이지 않습니다.', checks: DECO },
     ] },
+  step3t: { name: 'step3_test_server.py', step: 'STEP 3', title: '서버 점검 · LLM 없이 도구 불러 보기', src: 'src-step3t', runCmd: 'python step3_test_server.py',
+    intro: 'API 키 없이 서버에 직접 연결해 도구 목록을 받고, 도구 하나를 불러 봅니다. 에이전트가 MCP 서버를 쓰는 과정을 사람이 한 단계씩 해 보는 파일입니다.',
+    blanks: [
+      { line: 20, kind: 'exact', allowOpen: true, label: '서버 띄우고 연결하기', ph: '✎ MCPServerStdio로 서버를 띄우는 async with 블록 열기 (괄호는 열어 둔 채로)',
+        hint: 'async with MCPServerStdio( 까지 씁니다. 닫는 괄호는 23번째 줄 ") as server:"에 있습니다.',
+        checks: [[r => !/^async\s+with\s/.test(r), 'async with로 엽니다. 서버를 켜고, 블록이 끝나면 함께 끕니다.'],
+                 [r => !r.includes('MCPServerStdio('), 'MCPServerStdio( 로 연결합니다. 대문자와 소문자까지 똑같이 써 주세요.'],
+                 [r => !r.endsWith('('), '설정을 다음 줄부터 적으니 여는 괄호 ( 로 줄을 끝냅니다.']] },
+      { line: 22, kind: 'exact', label: '무엇으로 무엇을 실행할지', ph: '✎ command는 sys.executable, args는 [str(SERVER_PATH)]인 dict',
+        hint: 'params={"command": 실행할 프로그램, "args": [넘길 파일]}, 모양입니다.',
+        checks: [[r => !/^params\s*=/.test(r), 'params= 로 시작합니다.'], [r => !r.includes('sys.executable'), 'command에는 지금 쓰는 파이썬 sys.executable을 넣습니다.'],
+                 [r => !r.includes('SERVER_PATH'), 'args에는 서버 파일 경로를 글자로 바꿔 [str(SERVER_PATH)]처럼 넣습니다.'], COMMA] },
+      { line: 24, kind: 'exact', el: null, label: '도구 목록 받아 오기', ph: '✎ 서버에게 도구 목록을 요청해 tools에 담기',
+        hint: 'tools = await server.list_tools() 모양입니다.',
+        checks: [[r => !/^tools\s*=/.test(r), '결과를 tools에 담습니다. 바로 아래 줄에서 len(tools)를 씁니다.'], [r => !/\bawait\b/.test(r), 'list_tools() 앞에 await를 붙여 응답을 기다립니다.'],
+                 [r => !r.includes('list_tools('), 'server.list_tools()로 도구 목록을 요청합니다.']] },
+      { line: 31, kind: 'exact', label: '도구 직접 호출하기', ph: '✎ get_overview 도구를 입력 없이({}) 직접 불러 result에 담기',
+        hint: 'result = await server.call_tool("도구 이름", {입력값}) 모양입니다. 입력이 없으면 {}를 넣습니다.',
+        checks: [[r => !/^result\s*=/.test(r), '결과를 result에 담습니다. 아래 줄에서 result.content를 씁니다.'], [r => !/\bawait\b/.test(r), 'call_tool 앞에 await를 붙입니다.'],
+                 [r => !r.includes('call_tool('), 'server.call_tool(도구 이름, 입력값)으로 부릅니다.'], [r => !r.includes('get_overview'), '부를 도구는 get_overview입니다.']] },
+    ] },
   step4: { name: 'step4_agent.py', step: 'STEP 4', title: '에이전트 연결', src: 'src-step4', runCmd: 'python step4_agent.py',
     blanks: [
       { line: 50, kind: 'exact', allowOpen: true, label: '에이전트 만들기', ph: '✎ Agent 틀로 에이전트를 만들어 agent에 담기 (괄호는 열어 둔 채로)',
@@ -1242,8 +1578,31 @@ const FILES = {
         hint: 'STEP 4의 Runner.run(agent, question) 괄호 안에 session=session을 더합니다.',
         checks: [AWAIT, [r => !/session\s*=\s*session/.test(r), 'Runner.run에 session=session을 넘겨야 대화가 기억됩니다.']] },
     ] },
+  order: { name: 'order_mcp_server.py', step: '실시간 발주', title: '다른 주제의 MCP · 실시간 발주', src: 'src-order', runCmd: 'python order_mcp_server.py',
+    intro: 'get_stock, create_order, receive_order는 따라 쓰기에서 쓴 코드입니다. 같은 패턴으로 나머지 도구 list_orders와 cancel_order를 직접 완성합니다.',
+    blanks: [
+      { line: 75, kind: 'exact', label: 'list_orders를 도구로 등록', ph: '✎ 발주 목록 함수를 도구로 등록하기',
+        hint: '63번째 줄 get_stock 위에 같은 모양이 있습니다.', checks: DECO },
+      { line: 76, kind: 'exact', label: 'list_orders 이름과 타입 힌트', ph: '✎ 함수 이름 list_orders · 입력 status(글자 또는 None, 기본값 None) · 결과 list[dict]',
+        hint: 'personal-db의 list_projects와 같은 모양입니다. def 이름(status: str | None = None) -> list[dict]:',
+        checks: defChecks('list_orders') },
+      { line: 77, kind: 'doc', label: 'list_orders 설명서(docstring)', ph: '✎ 발주 목록을 돌려준다는 설명과 status에 넣을 값(접수, 입고 완료, 취소)',
+        hint: '"""로 열고 닫습니다. 무엇을 돌려주는지, status에 넣을 수 있는 값을 적어 보세요.' },
+      { line: 126, kind: 'exact', label: 'cancel_order를 도구로 등록', ph: '✎ 발주 취소 함수를 도구로 등록하기',
+        hint: '위의 다른 도구들과 같은 한 줄입니다.', checks: DECO },
+      { line: 127, kind: 'exact', label: 'cancel_order 이름과 타입 힌트', ph: '✎ 함수 이름 cancel_order · 입력 order_id(정수) · 결과 dict',
+        hint: '113번째 줄 receive_order와 같은 모양입니다. def cancel_order(order_id: int) -> dict:',
+        checks: defChecks('cancel_order') },
+      { line: 128, kind: 'doc', label: 'cancel_order 설명서(docstring)', ph: '✎ 입고 전 발주만 취소한다는 설명과, 사용자가 확인한 뒤에만 쓰라는 주의',
+        hint: '되돌리기 어려운 도구입니다. 언제 쓰는지와 주의할 점을 적어 보세요.' },
+    ] },
 };
-const FILE_ORDER = ['step3', 'step4', 'step5'];
+const FILE_ORDER = ['step3', 'step3t', 'step4', 'step5'];
+const ALL_FILES = ['step3', 'step3t', 'step4', 'step5', 'order'];
+const GROUPS = {
+  db: { folder: '1_따라쓰기', done: 'blanks:step3', doneLabel: '빈칸 채우기 시작' },
+  order: { folder: '3_다른 주제의 MCP', done: 'blanks:order', doneLabel: '빈칸 채우기: order_mcp_server.py' },
+};
 
 const ELEMENTS = [
   { key: '모델', blank: 's4-54', code: 'model=os.getenv("OPENAI_MODEL") or None', desc: '어떤 LLM이 판단할지' },
@@ -1446,7 +1805,7 @@ function buildDoc(lines) {
     starts.push(st); kinds.push(st.str ? openKind : null);
     const r = tokenizeLine(ln, st);
     if (r.state.str && (!st.str || ln.includes(st.str.q))) {
-      openKind = idx === 0 ? 'mod' : /INSTRUCTIONS\s*=/.test(ln) ? 'instr' : /SELECT|INSERT|UPDATE|DELETE/.test(ln) ? 'sql' : 'doc';
+      openKind = idx === 0 ? 'mod' : /INSTRUCTIONS\s*=/.test(ln) ? 'instr' : /SELECT|INSERT|UPDATE|DELETE|CREATE|executescript/.test(ln) ? 'sql' : 'doc';
     }
     toks.push(r.tokens); st = r.state;
   });
@@ -1605,7 +1964,7 @@ function diagDoc(b, r, E) {
    ================================================================ */
 const BLANK = {};
 function readSrc(id) { const el = document.getElementById(id); return el ? el.textContent.replace(/^\r?\n/, '').replace(/\s+$/, '') : ''; }
-for (const f of FILE_ORDER) {
+for (const f of ALL_FILES) {
   const F = FILES[f];
   F.id = f; F.lines = readSrc(F.src).split('\n'); F.doc = buildDoc(F.lines); F.byLine = {};
   F.blanks.forEach(b => {
@@ -1619,7 +1978,9 @@ for (const f of FILE_ORDER) {
   });
 }
 const LBY = {};
-LESSONS.forEach((L, n) => { L.n = n; L.doc = buildDoc(L.lines.map(x => x[1])); L.total = L.lines.filter(x => x[0] === 'T').length; LBY[L.id] = L; });
+LESSONS.forEach((L, n) => { L.n = n; L.group = L.group || 'db'; L.doc = buildDoc(L.lines.map(x => x[1])); L.total = L.lines.filter(x => x[0] === 'T').length; LBY[L.id] = L; });
+const GL = g => LESSONS.filter(L => L.group === g);
+LESSONS.forEach(L => { const gl = GL(L.group); L.gi = gl.indexOf(L); L.gn = gl.length; });
 
 /* 실행 중 상태 */
 const RUN = {};
@@ -1638,12 +1999,13 @@ function bst(id) { return SV.blanks[id] || (SV.blanks[id] = { status: 'empty', v
 function bt(id) { return BT[id] || (BT[id] = { lens: null, sq: null, reveal: 0 }); }
 const filled = s => s === 'correct' || s === 'revealed';
 function fileCounts(f) { const bs = FILES[f].blanks; return { total: bs.length, done: bs.filter(b => filled(bst(b.id).status)).length }; }
-function allCounts() {
+function allCounts(files) {
   let wrong = 0, empty = 0, done = 0, total = 0;
-  for (const f of FILE_ORDER) for (const b of FILES[f].blanks) { total++; const s = bst(b.id).status; if (s === 'wrong') wrong++; else if (s === 'empty') empty++; else done++; }
+  for (const f of (files || ALL_FILES)) for (const b of FILES[f].blanks) { total++; const s = bst(b.id).status; if (s === 'wrong') wrong++; else if (s === 'empty') empty++; else done++; }
   return { wrong, empty, done, total };
 }
-const lessonsDone = () => LESSONS.filter(L => SV.lessons[L.id] && SV.lessons[L.id].done).length;
+const lessonsDone = (g = 'db') => GL(g).filter(L => SV.lessons[L.id] && SV.lessons[L.id].done).length;
+const orderProgress = () => lessonsDone('order') + (fileCounts('order').done === fileCounts('order').total ? 1 : 0);
 const elLit = e => bst(e.blank).status === 'correct';
 
 /* ================================================================
@@ -1674,8 +2036,8 @@ function renderActions() {
 function renderCrumbs() {
   const t = UI.active || ''; const sep = '<span class="sep">›</span>'; let h = '';
   if (t === 'welcome') h = '시작';
-  else if (t.startsWith('lesson:')) h = `personal-db-agent${sep}1_따라쓰기${sep}${esc(LBY[t.slice(7)].file)}`;
-  else if (t.startsWith('blanks:')) h = `personal-db-agent${sep}2_빈칸채우기${sep}${esc(FILES[t.slice(7)].name)}${UI.sym ? `${sep}<span class="sym"><i></i>${esc(UI.sym)}</span>` : ''}`;
+  else if (t.startsWith('lesson:')) { const L = LBY[t.slice(7)]; h = `personal-db-agent${sep}${esc(GROUPS[L.group].folder)}${sep}${esc(L.file)}`; }
+  else if (t.startsWith('blanks:')) h = `personal-db-agent${sep}${t === 'blanks:order' ? '3_다른 주제의 MCP' : '2_빈칸채우기'}${sep}${esc(FILES[t.slice(7)].name)}${UI.sym ? `${sep}<span class="sym"><i></i>${esc(UI.sym)}</span>` : ''}`;
   else if (t.startsWith('sol:')) h = `personal-db-agent${sep}완성본${sep}${esc(FILES[t.slice(4)].name)}`;
   $('#crumbs').innerHTML = h;
 }
@@ -1687,28 +2049,33 @@ function folder(key, name, pad) {
   return `<button class="row ${closed ? 'closed' : ''}" data-act="fold" data-key="${key}" aria-expanded="${!closed}" style="padding-left:${pad}px"><span class="tw">${ic('chev')}</span><span class="fname">${esc(name)}</span></button>`;
 }
 function renderTree() {
-  let h = folder('typing', '1_따라쓰기', 4);
-  if (!SV.fold.typing) LESSONS.forEach(L => {
+  const lessonRow = L => {
     const R = RUN[L.id]; const d = SV.lessons[L.id] && SV.lessons[L.id].done;
     const badge = d ? `<span class="badge ok">${ic('check')}</span>` : R && !R.done && typedSoFar(L, R) > 0 ? `<span class="badge part">${typedSoFar(L, R)}/${L.total}</span>` : '';
-    h += row({ tab: 'lesson:' + L.id, name: L.file, desc: L.title, title: `${L.step} · ${L.title}`, pad: 22, on: UI.active === 'lesson:' + L.id, badge });
-  });
-  h += folder('blanks', '2_빈칸채우기', 4);
-  if (!SV.fold.blanks) FILE_ORDER.forEach(f => {
+    return row({ tab: 'lesson:' + L.id, name: L.file, desc: L.title, title: `${L.step} · ${L.title}`, pad: 22, on: UI.active === 'lesson:' + L.id, badge });
+  };
+  const blankRowT = (f, desc) => {
     const c = fileCounts(f);
     const badge = c.done === c.total ? `<span class="badge ok">${ic('check')}</span>` : `<span class="badge ${c.done ? 'part' : ''}">${c.done}/${c.total}</span>`;
-    h += row({ tab: 'blanks:' + f, name: FILES[f].name, desc: FILES[f].title, title: `${FILES[f].step} · ${FILES[f].title}`, pad: 22, on: UI.active === 'blanks:' + f, badge });
-  });
+    return row({ tab: 'blanks:' + f, name: FILES[f].name, desc: desc || FILES[f].title, title: `${FILES[f].step} · ${FILES[f].title}`, pad: 22, on: UI.active === 'blanks:' + f, badge });
+  };
+  let h = folder('typing', '1_따라쓰기', 4);
+  if (!SV.fold.typing) GL('db').forEach(L => { h += lessonRow(L); });
+  h += folder('blanks', '2_빈칸채우기', 4);
+  if (!SV.fold.blanks) FILE_ORDER.forEach(f => { h += blankRowT(f); });
+  h += folder('order', '3_다른 주제의 MCP', 4);
+  if (!SV.fold.order) { GL('order').forEach(L => { h += lessonRow(L); }); h += blankRowT('order', '빈칸 채우기 · 나머지 도구 완성'); }
   $('#tree').innerHTML = h;
 }
 function renderProgress() {
-  const ld = lessonsDone(), c = allCounts();
+  const ld = lessonsDone(), nDb = GL('db').length, c = allCounts(FILE_ORDER), op = orderProgress(), nOp = GL('order').length + 1;
   $('#sbProgress').innerHTML = `<div class="sb-head">진행 상황</div>
-    <div class="prog"><span>따라 쓰기</span><span class="bar"><i style="width:${100 * ld / LESSONS.length}%"></i></span><b>${ld}/${LESSONS.length}</b></div>
+    <div class="prog"><span>따라 쓰기</span><span class="bar"><i style="width:${100 * ld / nDb}%"></i></span><b>${ld}/${nDb}</b></div>
     <div class="prog"><span>빈칸 채우기</span><span class="bar"><i style="width:${100 * c.done / c.total}%"></i></span><b>${c.done}/${c.total}</b></div>
+    <div class="prog"><span>실시간 발주</span><span class="bar"><i style="width:${100 * op / nOp}%"></i></span><b>${op}/${nOp}</b></div>
     <div class="el-cap">에이전트의 네 요소 · step4 빈칸에서 직접 쓰기</div>
     <div class="el-mini">${ELEMENTS.map(e => `<span class="chip ${elLit(e) ? 'lit' : ''}">${e.key}</span>`).join('')}</div>`;
-  $('#tbProgress').innerHTML = `따라 쓰기 <b>${ld}</b>/${LESSONS.length} · 빈칸 <b>${c.done}</b>/${c.total}`;
+  $('#tbProgress').innerHTML = `따라 쓰기 <b>${ld}</b>/${nDb} · 빈칸 <b>${c.done}</b>/${c.total} · 실시간 발주 <b>${op}</b>/${nOp}`;
 }
 function renderStatus() {
   const c = allCounts(); const t = UI.active || '';
@@ -1751,18 +2118,21 @@ function peekHTML(ann, o) {
 const KEYS = [['_', 'Shift + -'], [':', 'Shift + ;'], ['"', "Shift + '"], ["'", "' (Enter 왼쪽)"], ['( )', 'Shift + 9 / 0'], ['[ ]', '[ ] (P 오른쪽)'],
   ['{ }', 'Shift + [ / ]'], ['@', 'Shift + 2'], ['|', 'Shift + \\ (₩ 키)'], ['->', '- 다음 Shift + .'], ['#', 'Shift + 3'], ['.', '마침표 (M 오른쪽 두 칸)']];
 function welcomeHTML() {
-  const firstOpen = LESSONS.find(L => !(SV.lessons[L.id] && SV.lessons[L.id].done)) || LESSONS[0];
+  const firstOpen = GL('db').find(L => !(SV.lessons[L.id] && SV.lessons[L.id].done)) || LESSONS[0];
+  const firstOrder = GL('order').find(L => !(SV.lessons[L.id] && SV.lessons[L.id].done));
   const firstBlank = FILE_ORDER.find(f => fileCounts(f).done < fileCounts(f).total) || 'step3';
-  const ld = lessonsDone(), c = allCounts();
-  const typedTotal = LESSONS.reduce((s, L) => s + L.total, 0);
+  const ld = lessonsDone(), c = allCounts(FILE_ORDER), op = orderProgress(), nOp = GL('order').length + 1;
+  const typedTotal = GL('db').reduce((s, L) => s + L.total, 0);
+  const orderTyped = GL('order').reduce((s, L) => s + L.total, 0);
   return `<div class="welcome">
   <div class="wl-hero"><h1>코드 손풀기</h1><p>VS Code를 설치하기 전에, 에이전트 실습 코드를 직접 써 보며 파이썬 코딩에 손을 익힙니다.</p></div>
   <div class="wl-cols">
     <div class="wl-col">
       <h2>시작</h2>
-      <button class="wl-start" data-act="open" data-tab="lesson:${firstOpen.id}">${ic('keyboard')}<span><b>따라 쓰기${ld ? ` · ${ld}/${LESSONS.length} 완료` : ''}</b><small>편집기 줄에 흐리게 보이는 핵심 코드를 따라 씁니다. 한 줄을 마칠 때마다 그 줄의 뜻이 펼쳐지고, Tab을 누르면 그 줄이 바로 채워집니다. 파일 ${LESSONS.length}개 · ${typedTotal}줄</small></span></button>
+      <button class="wl-start" data-act="open" data-tab="lesson:${firstOpen.id}">${ic('keyboard')}<span><b>따라 쓰기${ld ? ` · ${ld}/${GL('db').length} 완료` : ''}</b><small>편집기 줄에 흐리게 보이는 핵심 코드를 따라 씁니다. 한 줄을 마칠 때마다 그 줄의 뜻이 펼쳐지고, Tab을 누르면 그 줄이 바로 채워집니다. 파일 ${GL('db').length}개 · ${typedTotal}줄</small></span></button>
       <button class="wl-start" data-act="open" data-tab="blanks:${firstBlank}">${ic('pencil')}<span><b>빈칸 채우기${c.done ? ` · ${c.done}/${c.total} 완료` : ''}</b><small>실제 실습 파일에서 핵심 줄 ${c.total}곳만 비워 두었습니다. 나머지는 미리 채워져 있고, 막히면 힌트와 완성본이 있습니다.</small></span></button>
-      <p class="wl-note">따라 쓰기로 손을 푼 뒤 빈칸 채우기로 넘어가길 권합니다.</p>
+      <button class="wl-start" data-act="open" data-tab="${firstOrder ? 'lesson:' + firstOrder.id : 'blanks:order'}">${ic('files')}<span><b>다른 주제의 MCP · 실시간 발주${op ? ` · ${op}/${nOp} 완료` : ''}</b><small>같은 뼈대로 카페 재고·발주 MCP 서버를 만듭니다. 재고 조회, 발주, 입고 도구를 따라 쓰고(${GL('order').length}개 파일 · ${orderTyped}줄), 나머지 도구 2개는 빈칸으로 직접 완성합니다.</small></span></button>
+      <p class="wl-note">따라 쓰기로 손을 푼 뒤 빈칸 채우기, 다른 주제의 MCP 순서로 진행하길 권합니다.</p>
       <h2>사용법</h2>
       <ul class="wl-list">
         <li>코드 줄을 누르면 그 줄이 무슨 뜻인지 나옵니다.</li>
@@ -1792,7 +2162,7 @@ function welcomeHTML() {
 /* ---------- 따라 쓰기 ---------- */
 function lessonBanner(L, R) {
   const done = typedSoFar(L, R);
-  return `<div class="banner stick"><div class="bn-eyebrow">${L.step} · 따라 쓰기 ${L.n + 1}/${LESSONS.length}</div><div class="bn-row"><div class="bn-title">${esc(L.title)}</div><div class="bn-count">${R.done ? '완료' : `<b>${done}</b> / ${L.total}줄`}</div></div><div class="bn-goal">${esc(L.goal)}</div><div class="bn-keys"><span><kbd>Enter</kbd> 다음 줄</span><span><kbd>Tab</kbd> 이 줄 자동 채우기</span><span>코드 줄을 누르면 뜻이 나옵니다</span></div><div class="bn-bar"><i style="width:${100 * done / L.total}%"></i></div></div>`;
+  return `<div class="banner stick"><div class="bn-eyebrow">${L.step} · 따라 쓰기 ${L.gi + 1}/${L.gn}</div><div class="bn-row"><div class="bn-title">${esc(L.title)}</div><div class="bn-count">${R.done ? '완료' : `<b>${done}</b> / ${L.total}줄`}</div></div><div class="bn-goal">${esc(L.goal)}</div><div class="bn-keys"><span><kbd>Enter</kbd> 다음 줄</span><span><kbd>Tab</kbd> 이 줄 자동 채우기</span><span>코드 줄을 누르면 뜻이 나옵니다</span></div><div class="bn-bar"><i style="width:${100 * done / L.total}%"></i></div></div>`;
 }
 function renderLesson(L) {
   const R = run(L);
@@ -1923,21 +2293,26 @@ function finishLesson(L, R) {
   SV.lessons[L.id] = { done: true };
   persist();
   confetti();
-  if (lessonsDone() === LESSONS.length && !SV.seen.allTyping) {
+  if (L.group === 'db' && lessonsDone('db') === GL('db').length && !SV.seen.allTyping) {
     SV.seen.allTyping = true; persist();
-    setTimeout(() => toast('따라 쓰기 8개를 모두 마쳤습니다. 이제 실습 파일의 빈칸을 직접 채워 보세요.', { kind: 'ok', actions: [{ label: '빈칸 채우기 열기', run: () => openTab('blanks:step3') }] }), 700);
+    setTimeout(() => toast(`따라 쓰기 ${GL('db').length}개를 모두 마쳤습니다. 이제 실습 파일의 빈칸을 직접 채워 보세요.`, { kind: 'ok', actions: [{ label: '빈칸 채우기 열기', run: () => openTab('blanks:step3') }] }), 700);
+  }
+  if (L.group === 'order' && lessonsDone('order') === GL('order').length && !SV.seen.allOrder) {
+    SV.seen.allOrder = true; persist();
+    setTimeout(() => toast('실시간 발주 따라 쓰기를 마쳤습니다. 같은 패턴으로 나머지 도구 2개를 직접 완성해 보세요.', { kind: 'ok', actions: [{ label: 'order_mcp_server.py 열기', run: () => openTab('blanks:order') }] }), 700);
   }
 }
 function doneCard(L) {
-  const next = LESSONS[L.n + 1];
+  const next = GL(L.group)[L.gi + 1];
+  const G0 = GROUPS[L.group];
   const typed = L.lines.map((x, i) => [x, i]).filter(([x]) => x[0] === 'T');
   const recap = typed.map(([x, i]) => { const a = annAt(L.doc, i); return `<div class="recap-row"><code>${codeInline(x[1].trim())}</code><span>${a ? esc(a.t) : ''}</span></div>`; }).join('');
   return `<div class="done-card"><div class="dc">
-    <div class="dc-head"><div class="dc-check">${ic('check')}</div><div><div class="dc-eyebrow">${L.step} · 따라 쓰기 ${L.n + 1}/${LESSONS.length}</div><div class="dc-title">${esc(L.file)} 다 썼습니다</div></div></div>
+    <div class="dc-head"><div class="dc-check">${ic('check')}</div><div><div class="dc-eyebrow">${L.step} · 따라 쓰기 ${L.gi + 1}/${L.gn}</div><div class="dc-title">${esc(L.file)} 다 썼습니다</div></div></div>
     <div><div class="dc-label">방금 쓴 코드 ${L.total}줄, 한 줄씩 다시 보기</div><div class="recap">${recap}</div></div>
     ${L.output ? `<div class="dc-out">실행하면 이렇게 나옵니다<pre>${esc(L.output)}</pre></div>` : ''}
     <div class="dc-where">${esc(L.where)}</div>
-    <div class="p-actions">${next ? `<button class="btn" data-act="open" data-tab="lesson:${next.id}">다음 파일: ${esc(next.file)}</button>` : `<button class="btn" data-act="open" data-tab="blanks:step3">빈칸 채우기 시작</button>`}${L.link ? `<button class="btn sec" data-act="goto-blank" data-file="${L.link.file}" data-line="${L.link.line}">빈칸 채우기에서 직접 써 보기</button>` : ''}<button class="btn sec" data-act="restart" data-lesson="${L.id}">${ic('refresh')} 처음부터 다시</button></div>
+    <div class="p-actions">${next ? `<button class="btn" data-act="open" data-tab="lesson:${next.id}">다음 파일: ${esc(next.file)}</button>` : `<button class="btn" data-act="open" data-tab="${G0.done}">${esc(G0.doneLabel)}</button>`}${L.link ? `<button class="btn sec" data-act="goto-blank" data-file="${L.link.file}" data-line="${L.link.line}">빈칸 채우기에서 직접 써 보기</button>` : ''}<button class="btn sec" data-act="restart" data-lesson="${L.id}">${ic('refresh')} 처음부터 다시</button></div>
   </div></div>`;
 }
 function restartLesson(id) { const L = LBY[id]; RUN[id] = freshRun(L, true); if (UI.active !== 'lesson:' + id) openTab('lesson:' + id); else { renderEditor(); SC().scrollTop = 0; } refreshChrome(); }
@@ -1946,7 +2321,7 @@ function restartLesson(id) { const L = LBY[id]; RUN[id] = freshRun(L, true); if 
 function renderBlanks(f) {
   const F = FILES[f], doc = F.doc, c = fileCounts(f);
   let h = `<div class="banner"><div class="bn-eyebrow">${F.step} · 빈칸 채우기</div><div class="bn-row"><div class="bn-title">${esc(F.name)}</div><div class="bn-count"><b>${c.done}</b> / ${c.total}곳</div></div>
-    <div class="bn-goal">${esc(F.title)}. 노란 빈칸에 핵심 줄만 직접 씁니다. import, DB 연결, 예외 처리 같은 나머지 코드는 미리 채워 두었습니다.</div>
+    <div class="bn-goal">${esc(F.title)}. ${F.intro ? esc(F.intro) : '노란 빈칸에 핵심 줄만 직접 씁니다. import, DB 연결, 예외 처리 같은 나머지 코드는 미리 채워 두었습니다.'}</div>
     <div class="bn-keys"><span><kbd>Enter</kbd> 채점</span><span><kbd>Tab</kbd> 다음 빈칸</span><span><kbd>Ctrl</kbd>/<kbd>⌘</kbd> + <kbd>.</kbd> 힌트 메뉴</span><span>코드 줄을 누르면 뜻이 나옵니다</span></div>
     <div class="bn-bar"><i style="width:${100 * c.done / c.total}%"></i></div></div><div class="lines">`;
   doc.lines.forEach((text, i) => {
@@ -2187,7 +2562,7 @@ function renderPanel() {
   const body = $('#panelBody');
   if (UI.panelTab === 'problems') {
     let h = '';
-    FILE_ORDER.forEach(f => {
+    ALL_FILES.forEach(f => {
       const items = FILES[f].blanks.filter(b => !filled(bst(b.id).status));
       if (!items.length) return;
       h += `<div class="prob-file">${ic('chev')}<span class="ficon">py</span>${esc(FILES[f].name)}<span class="pcount">${items.length}</span></div>`;
@@ -2226,11 +2601,26 @@ function runLines(f) {
     out.push({ t: `SyntaxError: (연습용 안내) ${why}`, c: 'te' });
     return out;
   }
-  if (f === 'step3') {
-    out.push(prompt('python step3_mcp_server.py'));
-    out.push({ t: '(아무것도 출력하지 않고 기다립니다. 에이전트의 요청을 기다리는 정상 상태입니다.)', c: 'td' });
-    out.push({ t: '^C', c: 'td' });
+  if (f === 'step3t') {
+    const left = openBlanks('step3').length;
     out.push(prompt('python step3_test_server.py'));
+    if (left) {
+      out.push({ t: `서버를 띄우지 못했습니다. (연습용 안내) 이 파일이 실행하는 step3_mcp_server.py에 아직 채우지 않은 빈칸이 ${left}곳 있습니다. 그 파일부터 완성해 주세요.`, c: 'te' });
+      return out;
+    }
+  }
+  if (f === 'step3' || f === 'step3t') {
+    if (f === 'step3') {
+      out.push(prompt('python step3_mcp_server.py'));
+      out.push({ t: '(아무것도 출력하지 않고 기다립니다. 에이전트의 요청을 기다리는 정상 상태입니다.)', c: 'td' });
+      out.push({ t: '^C', c: 'td' });
+      if (openBlanks('step3t').length) {
+        out.push({ t: '# 서버가 도구를 잘 내놓는지는 step3_test_server.py로 점검합니다. 그 파일의 빈칸을 채운 뒤 ▶ 실행을 눌러 보세요.', c: 'td' });
+        return out;
+      }
+      out.push({ t: '# 서버 점검: step3_test_server.py', c: 'td' });
+      out.push(prompt('python step3_test_server.py'));
+    }
     out.push({ t: '도구 7개를 찾았습니다.' });
     [['get_overview', '오늘 날짜와 전체 현황(프로젝트별 진행률, 기한 지난 할 일, 7일 안에 마감인 할 일)을 한 번에 요약한다.'],
       ['list_projects', docFirst('s3-70')], ['list_tasks', '할 일 목록을 돌려준다. 조건은 모두 선택 사항이다.'],
@@ -2242,7 +2632,31 @@ function runLines(f) {
     out.push({ t: 'get_overview 를 직접 호출해 봅니다.' });
     out.push({ t: `{ "today": "${today()}", "projects": [ { "id": 1, "name": "블로그 리뉴얼", "status": "진행 중", "total": 4, "done": 1 }, ... ], ... } ...` });
     out.push({ t: '' });
-    out.push({ t: '# list_projects와 delete_task 설명에는 직접 쓴 docstring이 그대로 나옵니다.', c: 'td' });
+    out.push({ t: '# list_projects와 delete_task 설명에는 step3_mcp_server.py에 직접 쓴 docstring이 그대로 나옵니다.', c: 'td' });
+  } else if (f === 'order') {
+    const d = new Date(), hm = `${String(d.getHours()).padStart(2, '0')}:${String(d.getMinutes()).padStart(2, '0')}`;
+    out.push(prompt('python order_mcp_server.py'));
+    out.push({ t: '(아무것도 출력하지 않고 기다립니다. 에이전트의 요청을 기다리는 정상 상태입니다.)', c: 'td' });
+    out.push({ t: '^C', c: 'td' });
+    out.push({ t: '# 도구 점검: step3_test_server.py의 SERVER_PATH를 order_mcp_server.py로 바꿔 실행한 모습', c: 'td' });
+    out.push(prompt('python step3_test_server.py'));
+    out.push({ t: '도구 5개를 찾았습니다.' });
+    [['get_stock', '품목별 현재 재고를 지금 시각 기준으로 돌려준다.'], ['list_orders', docFirst('order-77')],
+      ['create_order', '품목을 공급처에 발주한다. quantity는 1 이상의 정수.'], ['receive_order', '발주한 물건이 도착하면 입고 처리한다. 재고가 주문 수량만큼 늘어난다.'],
+      ['cancel_order', docFirst('order-128')]].forEach(([n, dd]) => out.push({ h: `  - <span class="ta">${esc(n)}</span>: ${esc(dd)}` }));
+    out.push({ t: '' });
+    out.push({ t: '# 04_order_agent.py 구성으로 대화한 모습 (대화 루프는 step5와 같음)', c: 'td' });
+    out.push({ h: '나> <span class="ta">지금 발주해야 할 거 있어?</span>' });
+    out.push({ t: '  · 도구 호출: get_stock', c: 'td' });
+    out.push({ t: '' }); out.push({ t: `에이전트> ${hm} 기준으로 발주 기준 이하인 품목이 3개예요.` });
+    out.push({ t: '· 원두(에스프레소 블렌드) 3kg (기준 5kg)' }); out.push({ t: '· 오트밀크 4L (기준 6L)' }); out.push({ t: '· 테이크아웃 컵(16oz) 120개 (기준 200개)' });
+    out.push({ t: '' }); out.push({ h: '나> <span class="ta">원두 10kg 발주해 줘</span>' });
+    out.push({ h: `  <span class="tw">⚠ 'create_order' 실행 요청 {"item_id": 1, "quantity": 10} — 허용할까요? (y/n)</span> y` });
+    out.push({ t: '  · 도구 호출: create_order', c: 'td' });
+    out.push({ t: '' }); out.push({ t: `에이전트> 빈즈상사에 원두 10kg을 발주했어요. (발주 1번, ${hm})` });
+    out.push({ t: '' }); out.push({ h: '나> <span class="ta">원두 들어왔어</span>' });
+    out.push({ t: '  · 도구 호출: receive_order', c: 'td' });
+    out.push({ t: '' }); out.push({ t: '에이전트> 1번 발주를 입고 처리했어요. 원두 재고가 13kg이 됐어요.' });
   } else if (f === 'step4') {
     out.push(prompt('python step4_agent.py'));
     out.push({ t: "개인 DB 매니저입니다. 무엇을 도와드릴까요? ('끝' 입력 시 종료)" });
@@ -2469,6 +2883,7 @@ function init() {
   const h = (location.hash || '').slice(1);
   if (h === 'typing') { const L = LESSONS.find(x => !(SV.lessons[x.id] && SV.lessons[x.id].done)) || LESSONS[0]; UI.tabs.push('lesson:' + L.id); UI.active = 'lesson:' + L.id; }
   else if (h === 'blanks') { UI.tabs.push('blanks:step3'); UI.active = 'blanks:step3'; }
+  else if (h === 'order') { UI.tabs.push('lesson:o-stock'); UI.active = 'lesson:o-stock'; }
   render();
   window.addEventListener('resize', () => { if (!narrow()) { /* 넓은 화면에서는 탐색기 상태를 그대로 둔다 */ } });
 }
