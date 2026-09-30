@@ -458,6 +458,182 @@ canvas.confetti{position:absolute;inset:0;pointer-events:none;z-index:50;width:1
 </div>
 <div class="menu" id="menu" role="menu" hidden></div>
 
+<script type="text/plain" id="src-step1">
+"""
+STEP 1. 실습용 개인 DB 만들기
+
+실행: python step1_setup_db.py
+결과: data/my_projects.db 파일이 새로 만들어집니다.
+      (이미 있으면 지우고 처음 상태로 다시 만듭니다. 실습 중 DB를 망가뜨렸을 때도 이 파일을 다시 실행하세요.)
+
+마감일은 '오늘'을 기준으로 계산되므로, 언제 실행해도 "이번 주 마감", "기한 지난 일" 같은 질문이 자연스럽게 동작합니다.
+"""
+
+import sqlite3
+from datetime import date, timedelta
+from pathlib import Path
+
+DB_PATH = Path(__file__).parent / "data" / "my_projects.db"
+
+SCHEMA = """
+CREATE TABLE projects (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    name        TEXT NOT NULL,
+    description TEXT,
+    status      TEXT NOT NULL DEFAULT '진행 중',   -- '진행 중' | '보류' | '완료'
+    start_date  TEXT,                               -- YYYY-MM-DD
+    due_date    TEXT                                -- YYYY-MM-DD
+);
+
+CREATE TABLE tasks (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    project_id  INTEGER NOT NULL REFERENCES projects(id),
+    title       TEXT NOT NULL,
+    status      TEXT NOT NULL DEFAULT '할 일',      -- '할 일' | '진행 중' | '완료'
+    priority    TEXT NOT NULL DEFAULT '보통',       -- '높음' | '보통' | '낮음'
+    due_date    TEXT,                               -- YYYY-MM-DD
+    created_at  TEXT NOT NULL,
+    done_at     TEXT
+);
+"""
+
+# (이름, 설명, 상태, 시작일 오프셋, 마감일 오프셋)  ※ 오프셋 = 오늘로부터 며칠
+PROJECTS = [
+    ("블로그 리뉴얼", "개인 기술 블로그 디자인과 카테고리 개편", "진행 중", -30, 20),
+    ("가계부 앱 만들기", "사이드 프로젝트: 지출을 기록하는 모바일 웹앱", "진행 중", -45, 40),
+    ("정보처리기사 준비", "필기와 실기 대비 공부 계획", "진행 중", -60, 25),
+    ("이사 준비", "다음 달 이사를 위한 준비 목록", "보류", -10, 35),
+    ("독서 모임 운영", "월 1회 독서 모임 기획과 진행", "완료", -120, -5),
+]
+
+# (프로젝트 번호, 할 일, 상태, 우선순위, 마감 오프셋, 생성 오프셋, 완료 오프셋)
+TASKS = [
+    (1, "새 블로그 테마 고르기", "완료", "보통", -20, -28, -21),
+    (1, "카테고리 구조 다시 짜기", "진행 중", "높음", 2, -15, None),
+    (1, "예전 글 30개 태그 정리", "할 일", "보통", 9, -12, None),
+    (1, "소개 페이지 새로 쓰기", "할 일", "낮음", 16, -5, None),
+    (2, "화면 설계서 작성", "완료", "높음", -30, -44, -32),
+    (2, "지출 입력 화면 개발", "진행 중", "높음", -2, -25, None),
+    (2, "월별 통계 차트 붙이기", "할 일", "보통", 12, -20, None),
+    (2, "베타 테스터 5명 모집", "할 일", "낮음", 30, -3, None),
+    (3, "필기 기출 3회분 풀기", "완료", "높음", -15, -55, -16),
+    (3, "데이터베이스 과목 복습", "진행 중", "높음", 4, -20, None),
+    (3, "실기 프로그래밍 문제 정리", "할 일", "높음", 6, -10, None),
+    (3, "모의고사 1회 보기", "할 일", "보통", 20, -7, None),
+    (4, "이사업체 견적 3곳 받기", "할 일", "높음", -1, -9, None),
+    (4, "버릴 가구 목록 만들기", "할 일", "보통", 14, -8, None),
+    (4, "전입신고 서류 확인", "할 일", "낮음", 33, -8, None),
+    (5, "11월 도서 선정 투표", "완료", "보통", -40, -60, -41),
+    (5, "모임 장소 예약", "완료", "보통", -20, -35, -22),
+    (5, "후기 정리해서 공유", "완료", "낮음", -6, -18, -6),
+]
+
+
+def d(offset: int | None) -> str | None:
+    """오늘로부터 offset일 뒤의 날짜를 'YYYY-MM-DD' 문자열로 돌려줍니다."""
+    if offset is None:
+        return None
+    return (date.today() + timedelta(days=offset)).isoformat()
+
+
+def main() -> None:
+    DB_PATH.parent.mkdir(exist_ok=True)
+    if DB_PATH.exists():
+        DB_PATH.unlink()
+
+    conn = sqlite3.connect(DB_PATH)
+    conn.executescript(SCHEMA)
+    conn.executemany(
+        "INSERT INTO projects (name, description, status, start_date, due_date) VALUES (?, ?, ?, ?, ?)",
+        [(n, desc, s, d(start), d(due)) for n, desc, s, start, due in PROJECTS],
+    )
+    conn.executemany(
+        "INSERT INTO tasks (project_id, title, status, priority, due_date, created_at, done_at) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?)",
+        [(p, t, s, pr, d(due), d(created), d(done)) for p, t, s, pr, due, created, done in TASKS],
+    )
+    conn.commit()
+    conn.close()
+    print(f"DB 생성 완료: {DB_PATH}")
+    print(f"프로젝트 {len(PROJECTS)}개, 할 일 {len(TASKS)}개")
+
+
+if __name__ == "__main__":
+    main()
+</script>
+<script type="text/plain" id="src-step2">
+"""
+STEP 2. 데이터 조물조물 해 보기
+
+실행: python step2_explore_db.py
+
+에이전트를 만들기 전에, 우리가 다룰 데이터가 어떻게 생겼는지 직접 확인합니다.
+여기서 쓴 SQL 질문들이 그대로 MCP 서버의 '도구'가 됩니다.
+"""
+
+import sqlite3
+from pathlib import Path
+
+DB_PATH = Path(__file__).parent / "data" / "my_projects.db"
+
+
+def show(conn: sqlite3.Connection, title: str, sql: str, params: tuple = ()) -> None:
+    print(f"\n■ {title}")
+    cur = conn.execute(sql, params)
+    cols = [c[0] for c in cur.description]
+    print("  " + " | ".join(cols))
+    for row in cur.fetchall():
+        print("  " + " | ".join("" if v is None else str(v) for v in row))
+
+
+def main() -> None:
+    if not DB_PATH.exists():
+        print("DB가 없습니다. 먼저 python step1_setup_db.py 를 실행하세요.")
+        return
+
+    conn = sqlite3.connect(DB_PATH)
+
+    # 1) 어떤 표(테이블)가 있을까?
+    show(conn, "테이블 목록", "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'")
+
+    # 2) 프로젝트 전체 보기
+    show(conn, "프로젝트", "SELECT id, name, status, due_date FROM projects")
+
+    # 3) 진행 중인 할 일만 보기
+    show(conn, "진행 중인 할 일", "SELECT id, title, priority, due_date FROM tasks WHERE status = '진행 중'")
+
+    # 4) 두 표를 이어서(JOIN) 보기: 할 일이 어느 프로젝트 것인지
+    show(
+        conn,
+        "앞으로 7일 안에 마감인 할 일",
+        """
+        SELECT t.id, p.name AS project, t.title, t.due_date
+        FROM tasks t JOIN projects p ON p.id = t.project_id
+        WHERE t.status != '완료' AND t.due_date BETWEEN date('now', 'localtime') AND date('now', 'localtime', '+7 day')
+        ORDER BY t.due_date
+        """,
+    )
+
+    # 5) 집계: 프로젝트별 진행률
+    show(
+        conn,
+        "프로젝트별 진행률",
+        """
+        SELECT p.name,
+               COUNT(t.id) AS total,
+               SUM(t.status = '완료') AS done,
+               CAST(100.0 * SUM(t.status = '완료') / COUNT(t.id) AS INTEGER) || '%' AS progress
+        FROM projects p LEFT JOIN tasks t ON t.project_id = p.id
+        GROUP BY p.id
+        """,
+    )
+
+    conn.close()
+
+
+if __name__ == "__main__":
+    main()
+</script>
 <script type="text/plain" id="src-step3">
 """
 STEP 3. MCP 서버 만들기 — 개인 DB를 다루는 '도구 상자'
@@ -1026,6 +1202,54 @@ A(`print(rows)`, `화면에 출력하기`,
   `rows에 담긴 결과를 터미널에 보여 줍니다. 결과는 [('블로그 리뉴얼',), ...]처럼 줄마다 괄호로 묶여 나옵니다.`,
   [[`print(...)`, `괄호 안의 값을 화면에 출력`]]);
 
+/* ---------- STEP 1 · DB 만들기 (step1_setup_db.py) ---------- */
+A(`from datetime import date, timedelta`, `날짜 도구`, `date.today()로 오늘, timedelta(days=n)으로 'n일 뒤' 같은 날짜 계산을 합니다.`);
+A(`SCHEMA = """`, `표 설계도(SCHEMA)`, `두 표(projects, tasks)를 만드는 CREATE TABLE 문장을 여러 줄 글자로 적어 둡니다. 아래 main에서 한 번에 실행합니다.`);
+A(`PROJECTS = [`, `샘플 프로젝트 목록`, `프로젝트 5개를 (이름, 설명, 상태, 시작일, 마감일) 순서로 적었습니다. 날짜는 오늘로부터 며칠인지(오프셋)로 적어서, 언제 실행해도 자연스러운 날짜가 됩니다.`);
+A(`TASKS = [`, `샘플 할 일 목록`, `할 일 18개입니다. 맨 앞 숫자는 어느 프로젝트의 일인지(프로젝트 번호)입니다.`);
+A(`def d(offset: int | None) -> str | None:`, `날짜 계산 도우미`, `오프셋(오늘로부터 며칠)을 받아 날짜 글자로 돌려줍니다. 입력도 결과도 None일 수 있어서 | None이 붙었습니다.`, [[`offset: int | None`, `정수 또는 없음`], [`-> str | None`, `글자 또는 없음`]]);
+A(`"""오늘로부터 offset일 뒤의 날짜를 'YYYY-MM-DD' 문자열로 돌려줍니다."""`, `함수 설명(docstring)`, `도구 함수가 아니라 LLM이 읽지는 않습니다. 코드를 읽는 사람을 위한 설명입니다.`);
+A(`if offset is None:`, `값이 없으면`, `아직 완료되지 않은 할 일은 완료일 오프셋이 None입니다.`);
+A(`return None`, `None 돌려주기`, `날짜가 없다는 뜻으로 None을 돌려줍니다. DB에는 빈 값(NULL)으로 들어갑니다.`);
+A(`return (date.today() + timedelta(days=offset)).isoformat()`, `오늘 + offset일`, `오늘에 offset일을 더한 날짜를 'YYYY-MM-DD' 글자로 바꿔 돌려줍니다. 음수면 지난 날짜입니다.`);
+A(`def main() -> None:`, `프로그램 본체`, `DB를 새로 만들고 샘플 데이터를 넣는 순서가 이 함수에 모여 있습니다.`);
+A(`if DB_PATH.exists():`, `이미 DB가 있으면`, `예전에 만든 DB 파일이 있는지 확인합니다.`);
+A(`DB_PATH.unlink()`, `기존 DB 지우기`, `파일을 지우고 처음 상태로 다시 만듭니다. 실습 중 DB를 망가뜨렸을 때 step1을 다시 실행하면 되는 이유입니다.`);
+A(`conn.executescript(SCHEMA)`, `표 만들기`, `여러 SQL 문장을 한 번에 실행합니다. SCHEMA에 적은 CREATE TABLE 두 개가 실행되어 빈 표 두 개가 생깁니다.`, [[`executescript(...)`, `여러 SQL 문장 한꺼번에 실행`], [`SCHEMA`, `위에서 적은 표 설계도`]]);
+A(`"INSERT INTO projects (name, description, status, start_date, due_date) VALUES (?, ?, ?, ?, ?)",`, `프로젝트 넣는 SQL`, `프로젝트 표에 한 줄을 넣는 문장입니다. ? 다섯 자리에 값이 차례로 들어갑니다.`);
+A(`[(n, desc, s, d(start), d(due)) for n, desc, s, start, due in PROJECTS],`, `넣을 값 만들기`, `PROJECTS의 줄마다 날짜 오프셋을 d()로 실제 날짜로 바꿔 넣을 값 목록을 만듭니다(리스트 컴프리헨션).`);
+A(`"INSERT INTO tasks (project_id, title, status, priority, due_date, created_at, done_at) "`, `할 일 넣는 SQL (앞부분)`, `다음 줄의 문자열과 이어져 한 문장이 됩니다.`);
+A(`"VALUES (?, ?, ?, ?, ?, ?, ?)",`, `? 일곱 자리`, `나란히 적은 두 문자열은 하나로 이어집니다. ? 일곱 개에 값이 차례로 들어갑니다.`);
+A(`[(p, t, s, pr, d(due), d(created), d(done)) for p, t, s, pr, due, created, done in TASKS],`, `넣을 값 만들기`, `TASKS의 줄마다 날짜 오프셋 세 개를 실제 날짜로 바꿔 넣을 값 목록을 만듭니다.`);
+A(`conn.close()`, `연결 닫기`, `다 쓴 DB 연결을 닫습니다.`);
+A(`print(f"DB 생성 완료: {DB_PATH}")`, `결과 알려 주기`, `따옴표 앞의 f 덕분에 {DB_PATH} 자리에 실제 경로가 채워집니다(f-string).`, [[`f"…"`, `값을 채울 수 있는 글자`], [`{DB_PATH}`, `이 자리에 경로가 들어감`]]);
+A(`print(f"프로젝트 {len(PROJECTS)}개, 할 일 {len(TASKS)}개")`, `개수 알려 주기`, `len()은 목록의 길이입니다. 프로젝트 5개, 할 일 18개가 출력됩니다.`);
+A(`main()`, `main 실행`, `if __name__ == "__main__": 아래에서 본체 함수를 부릅니다.`);
+
+/* ---------- STEP 2 · SQL로 살펴보기 (step2_explore_db.py) ---------- */
+A(`def show(conn: sqlite3.Connection, title: str, sql: str, params: tuple = ()) -> None:`, `결과를 표처럼 보여 주는 함수`,
+  `DB 연결, 제목, SQL, 값을 받아 실행 결과를 보기 좋게 출력합니다. 이 파일의 SQL은 모두 이 함수로 실행합니다.`,
+  [[`sql: str`, `실행할 SQL 문장`], [`params: tuple = ()`, `? 자리 값, 기본은 없음`]]);
+A(`print(f"\\n■ {title}")`, `제목 출력`, `\\n으로 한 줄 띄우고 ■ 표시와 함께 제목을 보여 줍니다.`);
+A(`cur = conn.execute(sql, params)`, `SQL 실행하기`, `받은 SQL을 실행하고, 결과를 가리키는 cur(커서)를 받습니다. params는 ? 자리에 들어갈 값입니다.`,
+  [[`conn.execute(sql, params)`, `SQL 실행`], [`cur`, `결과를 가리키는 커서`]]);
+A(`cols = [c[0] for c in cur.description]`, `칸 이름 모으기`, `cur.description에 결과의 칸 정보가 들어 있습니다. 각 칸의 이름만 모읍니다.`);
+A(`print("  " + " | ".join(cols))`, `머리줄 출력`, `" | ".join(목록)은 목록을 " | "로 이어 붙인 글자를 만듭니다.`);
+A(`for row in cur.fetchall():`, `결과 줄 하나씩`, `fetchall()로 결과 줄을 모두 가져와 row로 하나씩 꺼냅니다.`, [[`for row in …:`, `목록에서 하나씩 꺼내 반복`], [`cur.fetchall()`, `결과 줄 전부`]]);
+A(`print("  " + " | ".join("" if v is None else str(v) for v in row))`, `한 줄 출력`, `값이 None이면 빈칸, 아니면 글자로 바꿔 " | "로 이어 출력합니다.`);
+A(`print("DB가 없습니다. 먼저 python step1_setup_db.py 를 실행하세요.")`, `해결 방법 안내`, `DB 파일이 없을 때 무엇을 먼저 해야 하는지 알려 줍니다.`);
+A(`return`, `함수 끝내기`, `return 뒤에 값이 없으면 여기서 함수를 그냥 끝냅니다.`);
+A(`show(conn, "테이블 목록", "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'")`, `어떤 표가 있는지`, `sqlite_master는 SQLite가 표 목록을 적어 두는 특별한 표입니다. sqlite_로 시작하는 내부 표는 뺍니다.`);
+A(`show(conn, "프로젝트", "SELECT id, name, status, due_date FROM projects")`, `프로젝트 전체 보기`, `SELECT 칸들 FROM 표. 조건 없이 모든 줄을 봅니다.`);
+A(`show(conn, "진행 중인 할 일", "SELECT id, title, priority, due_date FROM tasks WHERE status = '진행 중'")`, `SQL 한 문장으로 묻기`,
+  `SELECT 무엇을, FROM 어느 표에서, WHERE 어떤 조건으로. 파이썬 문자열 바깥은 큰따옴표, SQL 안의 값은 작은따옴표입니다.`,
+  [[`SELECT id, title, …`, `보여 줄 칸`], [`FROM tasks`, `할 일 표에서`], [`WHERE status = '진행 중'`, `진행 중인 것만`]]);
+A(`show(`, `여러 줄로 show 부르기`, `인자가 길 때는 괄호를 열고 한 줄에 하나씩 적습니다.`);
+A(`conn,`, `첫 번째 인자: DB 연결`, `어느 DB에 물을지 넘깁니다.`);
+A(`"앞으로 7일 안에 마감인 할 일",`, `두 번째 인자: 제목`, `출력할 때 ■ 옆에 붙는 제목입니다.`);
+A(`"프로젝트별 진행률",`, `두 번째 인자: 제목`, `출력할 때 ■ 옆에 붙는 제목입니다.`);
+A(`""",`, `여러 줄 SQL 닫기`, `따옴표 세 개로 여러 줄 SQL을 닫습니다. 끝의 쉼표는 다음 인자로 이어진다는 표시입니다.`);
+
 /* ---------- STEP 3 · MCP 서버 ---------- */
 A(`from mcp.server.mcpserver import MCPServer`, `MCP 서버 틀 가져오기`,
   `mcp 패키지에서 MCPServer를 가져옵니다. mcp 2.x 기준 경로입니다. 인터넷의 옛 예제에 나오는 mcp.server.fastmcp는 1.x 방식이라 지금은 ModuleNotFoundError가 납니다.`,
@@ -1092,7 +1316,7 @@ A(`def connect() -> sqlite3.Connection:`, `DB 연결 도우미 (도구 아님)`,
 A(`if not DB_PATH.exists():`, `DB 파일이 없으면`, `step1을 아직 실행하지 않은 경우를 대비한 예외 처리입니다.`);
 A(`raise FileNotFoundError("DB가 없습니다. 먼저 python step1_setup_db.py 를 실행하세요.")`, `이유를 알려 주며 멈추기`,
   `raise는 오류를 일으켜 실행을 멈춥니다. 메시지에 해결 방법까지 적어 둡니다.`);
-A(`conn = sqlite3.connect(DB_PATH)`, `DB 파일에 연결하기`, `위에서 정한 DB_PATH의 파일을 열어 conn에 담습니다.`);
+A(`conn = sqlite3.connect(DB_PATH)`, `DB 파일에 연결하기`, `위에서 정한 DB_PATH의 파일을 열어 conn에 담습니다. 파일이 없으면 이때 새로 만들어집니다.`, [[`sqlite3.connect(...)`, `DB 파일 열기(없으면 만들기)`], [`conn =`, `연결에 이름 붙이기`]]);
 A(`conn.row_factory = sqlite3.Row`, `결과를 이름으로 꺼내기`,
   `결과 한 줄을 {컬럼이름: 값}처럼 다루도록 설정합니다. 그래야 에이전트가 읽기 좋은 dict로 돌려줄 수 있습니다.`);
 A(`return conn`, `연결 돌려주기`, `열어 둔 DB 연결을 함수를 부른 쪽에 돌려줍니다.`);
@@ -1308,14 +1532,14 @@ A(`# (에이전트 정의와 대화 루프는 STEP 4와 같음)`, `생략 표시
 A(`from datetime import datetime`, `현재 시각 도구`, `datetime.now()로 지금 시각을 얻습니다. 발주·입고·조회 시각을 모두 여기서 만듭니다.`);
 A(`DB_PATH = Path(__file__).parent / "data" / "cafe_orders.db"`, `발주 DB 파일 위치`, `personal-db와 같은 방식으로 data 폴더 안의 파일을 가리킵니다. 파일이 없으면 처음 실행할 때 샘플 데이터로 만듭니다.`);
 A(`SAMPLE_ITEMS = [`, `샘플 품목 목록`, `품목, 단위, 현재 재고, 발주 기준, 공급처를 한 줄씩 적은 목록입니다. 원두·오트밀크·컵 세 가지가 발주 기준 이하로 시작합니다.`);
-AP(`("`, `샘플 품목 한 줄`, `(품목, 단위, 현재 재고, 발주 기준, 공급처) 순서입니다. 괄호로 묶은 값 묶음을 튜플이라고 합니다.`);
+AP(`("`, `샘플 데이터 한 줄`, `괄호로 묶은 값 묶음(튜플)이 데이터 한 줄입니다. 값의 순서는 바로 위 주석에 적힌 순서를 따릅니다.`);
 A(`mcp = MCPServer("realtime-order")`, `발주용 도구 상자 만들기`, `서버 이름만 realtime-order로 바뀌었고, 만드는 방법은 personal-db와 똑같습니다.`, [[`"realtime-order"`, `서버 이름표`]], `도구`);
 A(`first_run = not DB_PATH.exists()`, `처음 실행인지 확인`, `DB 파일이 아직 없으면 True입니다. 아래에서 표와 샘플 데이터를 만들지 이 값으로 정합니다.`);
 A(`DB_PATH.parent.mkdir(exist_ok=True)`, `data 폴더 만들기`, `폴더가 없으면 만들고, 이미 있으면 그대로 둡니다.`);
 A(`if first_run:`, `처음 실행일 때만`, `표를 만들고 샘플 품목을 넣습니다. 두 번째 실행부터는 건너뜁니다.`);
 A(`conn.executescript("""`, `여러 SQL 문장을 한 번에 실행`, `표 두 개(items 품목, orders 발주)를 만드는 SQL을 한꺼번에 실행합니다.`);
 A(`""")`, `여러 줄 SQL 닫기`, `따옴표 세 개로 SQL을 닫고, 괄호로 executescript 호출을 닫습니다.`);
-A(`conn.executemany(`, `여러 줄을 한 번에 넣기`, `같은 INSERT 문장에 SAMPLE_ITEMS의 줄을 하나씩 채워 모두 넣습니다.`);
+A(`conn.executemany(`, `여러 줄을 한 번에 넣기`, `같은 INSERT 문장에 목록의 줄을 하나씩 채워 모두 넣습니다.`);
 AP(`"INSERT INTO items`, `샘플 품목 넣는 SQL`, `품목 표에 한 줄을 넣는 문장입니다. ? 다섯 자리에 튜플의 값이 차례로 들어갑니다.`);
 A(`SAMPLE_ITEMS,`, `넣을 값 목록`, `위에서 적어 둔 샘플 품목입니다.`);
 A(`def now() -> str:`, `지금 시각 도우미`, `발주·입고·조회 시각을 모두 이 함수로 기록합니다. '실시간'의 기준점입니다. @mcp.tool()이 없으니 도구가 아닙니다.`);
@@ -1383,7 +1607,7 @@ const LESSONS = [
   { id: 'sql', file: '01_sql_in_python.py', step: 'STEP 2', title: '파이썬 안에서 SQL 실행하기',
     goal: 'SQL은 파이썬 안에서 따옴표 속 한 문장으로 실행됩니다.',
     output: `[('블로그 리뉴얼',), ('가계부 앱 만들기',), ('정보처리기사 준비',)]`,
-    where: 'step2_explore_db.py의 show 함수가 같은 방식으로 SQL을 실행합니다.',
+    link: { file: 'step2', line: 18 }, where: 'step2_explore_db.py의 show 함수(18–22줄)가 같은 방식으로 SQL을 실행합니다.',
     lines: [['T', 'import sqlite3'], ['E', ''], ['T', 'conn = sqlite3.connect("data/my_projects.db")'], ['E', ''],
       ['T', `sql = "SELECT name FROM projects WHERE status = '진행 중'"`], ['T', 'rows = conn.execute(sql).fetchall()'], ['T', 'print(rows)']] },
   { id: 'tool', file: '02_mcp_tool.py', step: 'STEP 3', title: '함수에 한 줄 붙여 도구 만들기',
@@ -1498,6 +1722,39 @@ const defChecks = (name) => [
 ];
 
 const FILES = {
+  step1: { name: 'step1_setup_db.py', step: 'STEP 1', title: 'DB 만들기', src: 'src-step1', runCmd: 'python step1_setup_db.py',
+    intro: '실습용 DB를 만드는 파일입니다. 표 설계(SCHEMA)와 샘플 데이터는 적혀 있고, DB에 연결하고 표를 만들고 저장하고 결과를 알려 주는 줄만 직접 씁니다.',
+    blanks: [
+      { line: 83, kind: 'exact', label: 'DB 파일에 연결하기', ph: '✎ DB_PATH 파일에 연결해 conn에 담기 (파일이 없으면 새로 생김)',
+        hint: 'conn = sqlite3.connect(파일 경로) 모양입니다. 경로는 15번째 줄의 DB_PATH입니다.',
+        checks: [[r => !/^conn\s*=/.test(r), '연결을 conn에 담습니다. 아래 줄들이 conn을 씁니다.'], [r => !r.includes('sqlite3.connect('), 'sqlite3.connect(경로)로 연결합니다.'], [r => !r.includes('DB_PATH'), '연결할 파일은 DB_PATH입니다.']] },
+      { line: 84, kind: 'exact', label: '표 만들기(SCHEMA 실행)', ph: '✎ 위에서 적은 SCHEMA(CREATE TABLE 두 개)를 한 번에 실행',
+        hint: 'conn.executescript(여러 SQL 문장) 모양입니다. 17번째 줄의 SCHEMA를 넣습니다.',
+        checks: [[r => !r.startsWith('conn.'), 'conn의 기능으로 실행합니다: conn.executescript(...)'], [r => !r.includes('executescript('), '여러 SQL 문장은 executescript로 한 번에 실행합니다.'], [r => /["']/.test(r), 'SCHEMA는 위에서 만든 변수 이름이라 따옴표 없이 씁니다.']] },
+      { line: 94, kind: 'exact', label: '변경 저장', ph: '✎ 지금까지 넣은 데이터를 DB 파일에 저장하기',
+        hint: 'conn.commit() 한 줄입니다. 이 줄이 없으면 넣은 데이터가 파일에 남지 않습니다.',
+        checks: [[r => !r.includes('commit'), '저장은 commit입니다.'], [r => !/\(\s*\)$/.test(r), 'commit 뒤에 괄호 ()를 붙여야 실행됩니다.']] },
+      { line: 96, kind: 'pattern', pattern: /^print\(f"[^"]*\{DB_PATH\}[^"]*"\)$/, template: v => `print(f"${v}")`, label: '결과 알려 주기(f-string)', ph: '✎ f-string으로 "DB 생성 완료: 경로"를 출력하기',
+        hint: 'print(f"DB 생성 완료: {DB_PATH}")처럼 따옴표 앞에 f를 붙이고, 값은 { } 안에 넣습니다.',
+        checks: [[r => !r.startsWith('print('), 'print(...)로 출력합니다.'], [r => !/f["']/.test(r), '따옴표 앞에 f를 붙여야 { } 안의 값이 채워집니다.'], [r => !r.includes('{DB_PATH}'), '경로는 {DB_PATH}처럼 중괄호 안에 넣습니다.']] },
+    ] },
+  step2: { name: 'step2_explore_db.py', step: 'STEP 2', title: 'SQL로 살펴보기', src: 'src-step2', runCmd: 'python step2_explore_db.py',
+    intro: '데이터를 SQL로 살펴보는 파일입니다. SQL을 실행하고 결과를 한 줄씩 꺼내는 줄, DB에 연결하는 줄, 그리고 SQL 한 문장을 직접 씁니다.',
+    blanks: [
+      { line: 18, kind: 'exact', label: 'SQL 실행하기', ph: '✎ 받은 sql을 params와 함께 실행해 cur에 담기',
+        hint: 'cur = conn.execute(SQL, 값) 모양입니다. 이 함수가 받은 sql과 params를 그대로 넘깁니다.',
+        checks: [[r => !/^cur\s*=/.test(r), '실행 결과를 cur에 담습니다. 바로 아래 줄에서 cur.description을 씁니다.'], [r => !r.includes('conn.execute('), 'conn.execute(...)로 SQL을 실행합니다.'], [r => !r.includes('params'), '? 자리에 넣을 값 params도 함께 넘깁니다.']] },
+      { line: 21, kind: 'exact', label: '결과 줄 하나씩 꺼내기', ph: '✎ cur의 결과 줄을 모두 가져와 row로 하나씩 반복',
+        hint: 'for 이름 in 목록: 모양입니다. 목록은 cur.fetchall()입니다.',
+        checks: [[r => !/^for\s/.test(r), 'for로 시작합니다.'], [r => !/\bin\b/.test(r), 'for row in ... 처럼 in이 필요합니다.'], [r => !r.includes('fetchall()'), '결과 줄 전부는 cur.fetchall()로 가져옵니다.'], [r => !r.endsWith(':'), 'for 줄은 콜론(:)으로 끝납니다. 콜론은 Shift + ;입니다.']] },
+      { line: 30, kind: 'exact', label: 'DB 파일에 연결하기', ph: '✎ DB_PATH 파일에 연결해 conn에 담기',
+        hint: 'step1_setup_db.py 83번째 줄과 같은 한 줄입니다.',
+        checks: [[r => !/^conn\s*=/.test(r), '연결을 conn에 담습니다. 아래 show(conn, ...)가 conn을 씁니다.'], [r => !r.includes('sqlite3.connect('), 'sqlite3.connect(경로)로 연결합니다.']] },
+      { line: 39, kind: 'exact', loose: true, label: 'SQL 한 문장으로 묻기', ph: '✎ tasks 표에서 진행 중인 할 일의 id, title, priority, due_date를 고르는 SQL로 show 부르기',
+        hint: `36번째 줄과 같은 모양입니다. 제목은 "진행 중인 할 일", SQL은 SELECT id, title, priority, due_date FROM tasks WHERE status = '진행 중'`,
+        checks: [[r => !r.startsWith('show('), 'show(conn, "제목", "SQL")로 부릅니다.'], [r => !/select/i.test(r), 'SQL은 SELECT로 시작합니다.'], [r => !/from\s+tasks/i.test(r), '할 일 표는 tasks입니다: FROM tasks'],
+                 [r => !/where/i.test(r), 'WHERE로 조건을 겁니다.'], [r => !r.includes("'진행 중'"), "SQL 안의 값 '진행 중'은 작은따옴표로 감쌉니다."]] },
+    ] },
   step3: { name: 'step3_mcp_server.py', step: 'STEP 3', title: 'MCP 서버 · 도구 만들기', src: 'src-step3', runCmd: 'python step3_test_server.py',
     blanks: [
       { line: 25, kind: 'exact', label: '도구 상자 만들기', ph: '✎ personal-db라는 이름의 MCP 서버를 만들어 mcp에 담기',
@@ -1597,8 +1854,8 @@ const FILES = {
         hint: '되돌리기 어려운 도구입니다. 언제 쓰는지와 주의할 점을 적어 보세요.' },
     ] },
 };
-const FILE_ORDER = ['step3', 'step3t', 'step4', 'step5'];
-const ALL_FILES = ['step3', 'step3t', 'step4', 'step5', 'order'];
+const FILE_ORDER = ['step1', 'step2', 'step3', 'step3t', 'step4', 'step5'];
+const ALL_FILES = ['step1', 'step2', 'step3', 'step3t', 'step4', 'step5', 'order'];
 const GROUPS = {
   db: { folder: '1_따라쓰기', done: 'blanks:step3', doneLabel: '빈칸 채우기 시작' },
   order: { folder: '3_다른 주제의 MCP', done: 'blanks:order', doneLabel: '빈칸 채우기: order_mcp_server.py' },
@@ -1805,7 +2062,8 @@ function buildDoc(lines) {
     starts.push(st); kinds.push(st.str ? openKind : null);
     const r = tokenizeLine(ln, st);
     if (r.state.str && (!st.str || ln.includes(st.str.q))) {
-      openKind = idx === 0 ? 'mod' : /INSTRUCTIONS\s*=/.test(ln) ? 'instr' : /SELECT|INSERT|UPDATE|DELETE|CREATE|executescript/.test(ln) ? 'sql' : 'doc';
+      const look = ln + ' ' + (lines[idx + 1] || '');
+      openKind = idx === 0 ? 'mod' : /INSTRUCTIONS\s*=/.test(ln) ? 'instr' : /SELECT|INSERT|UPDATE|DELETE|CREATE|executescript|SCHEMA\s*=/.test(look) ? 'sql' : 'doc';
     }
     toks.push(r.tokens); st = r.state;
   });
@@ -1825,6 +2083,7 @@ const G = {
   close: { t: '괄호 닫기', d: '여러 줄에 걸쳐 연 괄호를 닫는 줄입니다. 같은 색의 괄호가 서로 짝입니다.' },
   tq: { t: '여러 줄 글자의 시작 또는 끝', d: '따옴표 세 개(""")는 여러 줄에 걸친 글자를 열고 닫습니다.' },
   ret: { t: '결과 돌려주기', d: 'return 뒤의 값을 함수를 부른 쪽에 돌려주고 함수를 끝냅니다.' },
+  tuple: { t: '샘플 데이터 한 줄', d: '괄호로 묶은 값 묶음(튜플)이 데이터 한 줄입니다. 값의 순서는 목록 위 주석에 적힌 순서를 따릅니다.' },
   cond: { t: '조건 검사', d: '조건이 맞을 때만 아래 들여쓴 줄을 실행합니다.' },
 };
 function normKey(text) { const sc = scan(text); return (sc.comment >= 0 ? text.slice(0, sc.comment) : text).trim(); }
@@ -1841,6 +2100,7 @@ function annAt(doc, i) {
   if (t.startsWith('#')) return /[─—]{4,}/.test(t) ? G.div : G.com;
   if (/^(f?"""|")?\s*(SELECT|INSERT|UPDATE|DELETE|FROM|WHERE|GROUP BY|ORDER BY)\b/.test(t)) return G.sql;
   if (/^[)\]}]+[,:]?$/.test(k)) return G.close;
+  if (/^\(.*\),?$/.test(k)) return G.tuple;
   if (k.startsWith('return ')) return G.ret;
   if (/^(if|elif) /.test(k)) return G.cond;
   return null;
@@ -1932,6 +2192,7 @@ function diagnose(b, raw0, attempts) {
   } else {
     const alts = [b.canon]; if (b.optComma) alts.push(b.canon.replace(/,$/, ''));
     if (alts.includes(sc.canon)) return okRes(b, r);
+    if (b.loose) { const L = x => x.replace(/\s+/g, ' ').replace(/\s*([=,()<>!])\s*/g, '$1').toLowerCase(); if (alts.map(L).includes(L(sc.canon))) return okRes(b, r); }
   }
   const rs = scan(ref), tc = rs.canon, uc = sc.canon;
   let k = 0; while (k < uc.length && k < tc.length && uc[k] === tc[k]) k++;
@@ -2657,6 +2918,28 @@ function runLines(f) {
     out.push({ t: '' }); out.push({ h: '나> <span class="ta">원두 들어왔어</span>' });
     out.push({ t: '  · 도구 호출: receive_order', c: 'td' });
     out.push({ t: '' }); out.push({ t: '에이전트> 1번 발주를 입고 처리했어요. 원두 재고가 13kg이 됐어요.' });
+  } else if (f === 'step1') {
+    const st = bst('s1-96');
+    const msg = (st.lock || '').match(/f["']([^"']*)["']/);
+    out.push(prompt('python step1_setup_db.py'));
+    out.push({ t: (msg ? msg[1] : 'DB 생성 완료: {DB_PATH}').replace('{DB_PATH}', '/Users/…/personal-db-agent/data/my_projects.db') });
+    out.push({ t: '프로젝트 5개, 할 일 18개' });
+    out.push({ t: '' });
+    out.push({ t: '# data 폴더에 my_projects.db가 생겼습니다. 다음은 step2_explore_db.py로 데이터를 살펴봅니다.', c: 'td' });
+  } else if (f === 'step2') {
+    out.push(prompt('python step2_explore_db.py'));
+    if (openBlanks('step1').length) {
+      out.push({ t: 'DB가 없습니다. 먼저 python step1_setup_db.py 를 실행하세요.' });
+      out.push({ t: '# (연습용 안내) step1_setup_db.py의 빈칸을 먼저 채워야 DB가 만들어집니다.', c: 'td' });
+      return out;
+    }
+    const D = n => { const d = new Date(); d.setDate(d.getDate() + n); return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`; };
+    const sec = (title, head, rows) => { out.push({ t: '' }); out.push({ t: `■ ${title}` }); out.push({ t: '  ' + head.join(' | ') }); rows.forEach(rw => out.push({ t: '  ' + rw.join(' | ') })); };
+    sec('테이블 목록', ['name'], [['projects'], ['tasks']]);
+    sec('프로젝트', ['id', 'name', 'status', 'due_date'], [[1, '블로그 리뉴얼', '진행 중', D(20)], [2, '가계부 앱 만들기', '진행 중', D(40)], [3, '정보처리기사 준비', '진행 중', D(25)], [4, '이사 준비', '보류', D(35)], [5, '독서 모임 운영', '완료', D(-5)]]);
+    sec('진행 중인 할 일', ['id', 'title', 'priority', 'due_date'], [[2, '카테고리 구조 다시 짜기', '높음', D(2)], [6, '지출 입력 화면 개발', '높음', D(-2)], [10, '데이터베이스 과목 복습', '높음', D(4)]]);
+    sec('앞으로 7일 안에 마감인 할 일', ['id', 'project', 'title', 'due_date'], [[2, '블로그 리뉴얼', '카테고리 구조 다시 짜기', D(2)], [10, '정보처리기사 준비', '데이터베이스 과목 복습', D(4)], [11, '정보처리기사 준비', '실기 프로그래밍 문제 정리', D(6)]]);
+    sec('프로젝트별 진행률', ['name', 'total', 'done', 'progress'], [['블로그 리뉴얼', 4, 1, '25%'], ['가계부 앱 만들기', 4, 1, '25%'], ['정보처리기사 준비', 4, 1, '25%'], ['이사 준비', 3, 0, '0%'], ['독서 모임 운영', 3, 3, '100%']]);
   } else if (f === 'step4') {
     out.push(prompt('python step4_agent.py'));
     out.push({ t: "개인 DB 매니저입니다. 무엇을 도와드릴까요? ('끝' 입력 시 종료)" });
@@ -2882,7 +3165,7 @@ function init() {
   bindGlobal();
   const h = (location.hash || '').slice(1);
   if (h === 'typing') { const L = LESSONS.find(x => !(SV.lessons[x.id] && SV.lessons[x.id].done)) || LESSONS[0]; UI.tabs.push('lesson:' + L.id); UI.active = 'lesson:' + L.id; }
-  else if (h === 'blanks') { UI.tabs.push('blanks:step3'); UI.active = 'blanks:step3'; }
+  else if (h === 'blanks') { UI.tabs.push('blanks:' + FILE_ORDER[0]); UI.active = 'blanks:' + FILE_ORDER[0]; }
   else if (h === 'order') { UI.tabs.push('lesson:o-stock'); UI.active = 'lesson:o-stock'; }
   render();
   window.addEventListener('resize', () => { if (!narrow()) { /* 넓은 화면에서는 탐색기 상태를 그대로 둔다 */ } });
